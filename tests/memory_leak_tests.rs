@@ -32,12 +32,11 @@ mod test{
 
     impl TrackedProduct {
         fn new(category: String, brand: String, price: f64) -> Self {
-            CREATE_COUNTER.fetch_add(1, Ordering::SeqCst);
             Self {
                 category,
                 brand,
                 price,
-                _id: CREATE_COUNTER.load(Ordering::SeqCst),
+                _id: CREATE_COUNTER.fetch_add(1, Ordering::SeqCst) +1,
             }
         }
     }
