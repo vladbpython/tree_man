@@ -40,52 +40,6 @@ mod tests {
     }
 
     #[test]
-    fn test_simple() {
-        println!("== Simple Test ==");
-        
-        // 1. Create catalog
-        let products = create_realistic_products();
-        let catalog = Arc::new(GroupData::new_root("Catalog".to_string(), products, "All Products"));
-        
-        println!("Created catalog with {} products", catalog.data.len());
-        assert_eq!(catalog.data.len(), 14);
-        
-        // 2. Group by category
-        catalog.group_by(|p| p.category.clone(), "Categories");
-        assert_eq!(catalog.subgroups_count(), 3);
-        println!("Grouped into {} categories", catalog.subgroups_count());
-        
-        // 3. Navigate to Phones
-        let phones = catalog.get_subgroup(&"Phones".to_string()).unwrap();
-        assert_eq!(phones.data.len(), 5);
-        println!("Phones category has {} products", phones.data.len());
-        
-        // 4. Group phones by brand
-        phones.group_by(|p| p.brand.clone(), "Brands");
-        assert_eq!(phones.subgroups_count(), 3); // Apple, Samsung, Google
-        println!("Phones grouped into {} brands", phones.subgroups_count());
-        
-        // 5. Navigate throgh brands using LinkedList
-        let keys = phones.subgroups_keys();
-        let first_brand = phones.get_subgroup(&keys[0]).unwrap();
-        println!("First brand: {:?} ({} products)", first_brand.key, first_brand.data.len());
-        
-        let second_brand = first_brand.go_to_next_relative().unwrap();
-        println!("Second brand: {:?} ({} products)", second_brand.key, second_brand.data.len());
-        
-        // 6. Filter: only in stock and > $700
-        second_brand.filter(|p| p.in_stock && p.price > 700.0);
-        println!("Filtered to {} products (in stock & > $700)", second_brand.data.len());
-        
-        // 7. Navigate back to root
-        let back_to_root = second_brand.go_to_root();
-        assert_eq!(back_to_root.key, "Catalog");
-        println!("Navigated back to root");
-        
-        println!("Complete successfully!");
-    }
-
-    #[test]
     fn test_parallel_filter() {
         println!("== Parallel Filter ==");
         
@@ -171,14 +125,6 @@ mod tests {
         // Back to phones
         let back_to_phones = brand.go_to_parent().unwrap();
         assert_eq!(back_to_phones.key, "Phones");
-        
-        // To laptops (sibling)
-        let laptops = back_to_phones.go_to_next_relative();
-        assert!(laptops.is_some());
-        
-        let laptops = laptops.unwrap();
-        assert!(laptops.key == "Laptops" || laptops.key == "Tablets");
-        
         println!("navigation successful!");
     }
 

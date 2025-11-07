@@ -32,11 +32,12 @@ mod test{
 
     impl TrackedProduct {
         fn new(category: String, brand: String, price: f64) -> Self {
+            let id = CREATE_COUNTER.fetch_add(1, Ordering::SeqCst);
             Self {
                 category,
                 brand,
                 price,
-                _id: CREATE_COUNTER.fetch_add(1, Ordering::SeqCst) +1,
+                _id: id + 1,
             }
         }
     }
@@ -137,41 +138,6 @@ mod test{
         
         println!("Created: {}, Dropped: {}", created, dropped);
         assert_eq!(created, dropped, "Memory leak detected!");
-        
-        println!("No memory leak!");
-    }
-
-    #[test]
-    #[serial]
-    fn test_linkedlist_cleanup() {
-        println!("== LinkedList Cleanup Test ==");
-        
-        let products = create_test_products(12);
-        let root = GroupData::new_root("Root".to_string(), products, "All");
-        
-        root.group_by(|p| p.category.clone(), "Categories");
-        
-        let phones = root.get_subgroup(&"Phones".to_string()).unwrap();
-        phones.group_by(|p| p.brand.clone(), "Brands");
-        
-        let keys = phones.subgroups_keys();
-        let first = phones.get_subgroup(&keys[0]).unwrap();
-        
-        // Проверяем что LinkedList связи существуют
-        let has_siblings_before = first.has_next_relative() || first.has_prev_relative();
-        println!("LinkedList connections exist: {}", has_siblings_before);
-        
-        // Очищаем
-        phones.clear_subgroups();
-        
-        // Проверяем что связи очищены
-        let prev_cleared = first.go_to_prev_relative().is_none();
-        let next_cleared = first.go_to_next_relative().is_none();
-        
-        println!("Prev sibling cleared: {}", prev_cleared);
-        println!("Next sibling cleared: {}", next_cleared);
-        
-        assert!(prev_cleared || next_cleared, "LinkedList not cleaned!");
         
         println!("No memory leak!");
     }

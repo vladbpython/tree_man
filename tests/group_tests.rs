@@ -93,65 +93,6 @@ mod unit_tests{
     }
 
     #[test]
-    fn test_sibling_navigation() {
-        println!("== Relatives Navigation ==");
-        
-        let products = create_test_products(12);
-        let root = GroupData::new_root("Root".to_string(), products, "All");
-        
-        root.group_by(|p| p.category.clone(), "Categories");
-        
-        let keys = root.subgroups_keys();
-        let first = root.get_subgroup(&keys[0]).unwrap();
-        
-        assert!(!first.has_prev_relative());
-        assert!(first.has_next_relative());
-        
-        let second = first.go_to_next_relative();
-        assert!(second.is_some());
-        
-        let second = second.unwrap();
-        assert!(second.has_next_relative());
-        
-        println!("== Relatives Navigation == works");
-    }
-
-    #[test]
-    fn test_linkedlist_structure() {
-        println!("== Linked List ==");
-        
-        let products = create_test_products(16);
-        let root = GroupData::new_root("Root".to_string(), products, "All");
-        
-        root.group_by(|p| p.brand.clone(), "Brands");
-        
-        let keys = root.subgroups_keys();
-        assert_eq!(keys.len(), 4); // Apple, Samsung, Dell, Lenovo
-        
-        // Test forward traversal
-        let mut current = root.get_subgroup(&keys[0]).unwrap();
-        let mut count = 1;
-        
-        while let Some(next) = current.go_to_next_relative() {
-            count += 1;
-            current = next;
-        }
-        
-        assert_eq!(count, 4);
-        
-        // Test backward traversal
-        let mut count = 1;
-        while let Some(prev) = current.go_to_prev_relative() {
-            count += 1;
-            current = prev;
-        }
-        
-        assert_eq!(count, 4);
-        
-        println!("== Linked List == correct");
-    }
-
-    #[test]
     fn test_get_path() {
         println!("== Get Path ==");
         

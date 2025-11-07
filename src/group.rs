@@ -3,47 +3,48 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Weak},
+    fmt::Debug,
+    collections::HashMap,
+    hash::Hash, 
+    sync::{
+        Arc, 
+        Weak
+    },
 };
 
 
 pub struct GroupData<K, V>
 where
-    K: Ord + Clone + Send + Sync,  // Send + Sync для параллельной обработки
+    K: Ord + Eq + Hash + Clone + Send + Sync,
     V: Send + Sync,
 {
     pub key: K,
     pub data: Arc<FilterData<V>>,
     
-    // Дерево
-    // Weak ссылка на родителя (нет циклов)
+    // Дерево - Weak ссылка на родителя (циклическая ссылка)
     parent: Option<Weak<GroupData<K, V>>>,
-    subgroups: ArcSwap<BTreeMap<K, Arc<GroupData<K, V>>>>,
-    prev_relative: ArcSwap<Option<Weak<GroupData<K, V>>>>,
-    next_relative: ArcSwap<Option<Weak<GroupData<K, V>>>>,
+    subgroups: ArcSwap<HashMap<K, Arc<GroupData<K, V>>>>,
     
-    pub description: Option<String>,
+    pub description: Option<Arc<str>>,
     depth: usize,
+    
     // Mutex только для group_by 
     write_lock: Mutex<()>,
 }
 
 impl<K, V> GroupData<K, V>
 where
-    K: Ord + Clone + std::fmt::Debug + Send + Sync,
+    K: Ord + Eq + Hash + Clone + Debug + Send + Sync,
     V: Send + Sync + Clone,
 {
-    /// Создать корневую группу
+    // Создать корневую группу
     pub fn new_root(key: K, data: Vec<V>, description: &str) -> Arc<Self> {
         Arc::new(Self {
             key,
             data: Arc::new(FilterData::from_vec(data)),
             parent: None,
-            subgroups: ArcSwap::from_pointee(BTreeMap::new()),
-            prev_relative: ArcSwap::from_pointee(None),
-            next_relative: ArcSwap::from_pointee(None),
-            description: Some(description.to_string()),
+            subgroups: ArcSwap::from_pointee(HashMap::new()),
+            description: Some(Arc::from(description)),
             depth: 0,
             write_lock: Mutex::new(()),
         })
@@ -53,169 +54,80 @@ where
         key: K,
         data: Arc<FilterData<V>>,
         parent: &Arc<Self>,
-        description: &str,
+        description: Arc<str>,
         depth: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             key,
             data,
             parent: Some(Arc::downgrade(parent)),
-            subgroups: ArcSwap::from_pointee(BTreeMap::new()),
-            prev_relative: ArcSwap::from_pointee(None),
-            next_relative: ArcSwap::from_pointee(None),
-            description: Some(description.to_string()),
+            subgroups: ArcSwap::from_pointee(HashMap::new()),
+            description: Some(description),
             depth,
             write_lock: Mutex::new(()),
         })
     }
 
-    // Группировка с созданием сязанного между детьми
     pub fn group_by<F>(self: &Arc<Self>, extractor: F, description: &str)
     where
         F: Fn(&V) -> K + Sync + Send,
     {
         let items = self.data.items();
+        let description_arc: Arc<str> = Arc::from(description);
         
-        // Параллельная группировка
-        let grouped: BTreeMap<K, Vec<Arc<V>>> = items
+        // 🚀 FxHashMap - самая быстрая группировка
+        let grouped: HashMap<K, Vec<Arc<V>>> = items
             .par_iter()
             .fold(
-                || BTreeMap::new(),
-                |mut acc: BTreeMap<K, Vec<Arc<V>>>, item| {
-                    let key = extractor(item);
-                    acc.entry(key).or_insert_with(Vec::new).push(Arc::clone(item));
+                || HashMap::new(),
+                |mut acc, item| {
+                    acc.entry(extractor(item))
+                        .or_insert_with(|| Vec::with_capacity(64))
+                        .push(Arc::clone(item));
                     acc
-                }
+                },
             )
             .reduce(
-                || BTreeMap::new(),
+                || HashMap::new(),
                 |mut acc, map| {
                     for (key, mut items) in map {
-                        acc.entry(key).or_insert_with(Vec::new).append(&mut items);
+                        match acc.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(items);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                e.get_mut().append(&mut items);
+                            }
+                        }
                     }
                     acc
-                }
+                },
             );
         
         let new_depth = self.depth + 1;
+        let mut new_subgroups = HashMap::with_capacity_and_hasher(
+            grouped.len(),
+            Default::default(),
+        );
         
-        // Создаем подгруппы
-        let new_subgroups: Vec<(K, Arc<GroupData<K, V>>)> = grouped
-            .into_iter()
-            .map(|(key, items)| {
-                let subgroup = Self::new_child(
-                    key.clone(),
+        for (key, items) in grouped {
+            new_subgroups.insert(
+                key.clone(),
+                Self::new_child(
+                    key,
                     Arc::new(FilterData::from_vec_arc_value(items)),
                     self,
-                    description,
+                    Arc::clone(&description_arc),
                     new_depth,
-                );
-                (key, subgroup)
-            })
-            .collect();
-        
-        // строим родсвтенные связи детей (горизонтально)  
-        for i in 0..new_subgroups.len() {
-            // Предыдущий родственник
-            if i > 0 {
-                let prev = &new_subgroups[i - 1].1;
-                new_subgroups[i].1.prev_relative.store(Arc::new(Some(Arc::downgrade(prev))));
-            }
-            
-            // Следующий родственник
-            if i + 1 < new_subgroups.len() {
-                let next = &new_subgroups[i + 1].1;
-                new_subgroups[i].1.next_relative.store(Arc::new(Some(Arc::downgrade(next))));
-            }
+                ),
+            );
         }
-        
-        let new_subgroups: BTreeMap<K, Arc<GroupData<K, V>>> = 
-            new_subgroups.into_iter().collect();
         
         let _guard = self.write_lock.lock();
         self.subgroups.store(Arc::new(new_subgroups));
     }
 
-    // Переходим к следующему родсвтеннику
-    pub fn go_to_next_relative(self: &Arc<Self>) -> Option<Arc<Self>> {
-        let next_weak_opt = self.next_relative.load();
-        
-        if let Some(weak) = next_weak_opt.as_ref() {
-            if let Some(next) = weak.upgrade() {
-                return Some(next);
-            }
-        }
-        None
-    }
-
-    // Переходим предыдущему родственнику
-    pub fn go_to_prev_relative(self: &Arc<Self>) -> Option<Arc<Self>> {
-        let prev_weak_opt = self.prev_relative.load();
-        
-        if let Some(weak) = prev_weak_opt.as_ref() {
-            if let Some(prev) = weak.upgrade() {
-                return Some(prev);
-            }
-        }
-        None
-    }
-
-    // Переходим к самому первому родственнику
-    pub fn go_to_first_relative(self: &Arc<Self>) -> Arc<Self> {
-        let mut current = Arc::clone(self);
-        while let Some(prev) = current.go_to_prev_relative() {
-            current = prev;
-        }
-        current
-    }
-
-    // Переходим к самому последнему родсвтеннику
-    pub fn go_to_last_relative(self: &Arc<Self>) -> Arc<Self> {
-        let mut current = Arc::clone(self);
-        while let Some(next) = current.go_to_next_relative() {
-            current = next;
-        }
-        current
-    }
-
-    // Провекрка на сущетсвование предыдущего родственника
-    pub fn has_prev_relative(&self) -> bool {
-        self.prev_relative.load().is_some()
-    }
-
-    // Провекра на существование следуюзего родсвтенника
-    pub fn has_next_relative(&self) -> bool {
-        self.next_relative.load().is_some()
-    }
-
-    // Получаем всех родсвтенников (включая себя)
-    pub fn get_all_relatives(&self) -> Vec<Arc<Self>> {
-        let first = Arc::new(Self {
-            key: self.key.clone(),
-            data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
-            subgroups: ArcSwap::new(self.subgroups.load_full()),
-            prev_relative: ArcSwap::new(self.prev_relative.load_full()),
-            next_relative: ArcSwap::new(self.next_relative.load_full()),
-            description: self.description.clone(),
-            depth: self.depth,
-            write_lock: Mutex::new(()),
-        });
-        
-        let first = first.go_to_first_relative();
-        
-        let mut relatives = vec![Arc::clone(&first)];
-        let mut current = first;
-        
-        while let Some(next) = current.go_to_next_relative() {
-            relatives.push(Arc::clone(&next));
-            current = next;
-        }
-        
-        relatives
-    }
-
-    // Переходим к родителю (с автоочисткой)
+    // Переход к родителю (с автоочисткой подгрупп)
     pub fn go_to_parent(self: &Arc<Self>) -> Option<Arc<Self>> {
         if let Some(parent_weak) = &self.parent {
             if let Some(parent) = parent_weak.upgrade() {
@@ -226,16 +138,12 @@ where
         None
     }
 
-    // Спускаемся к указанному ребенку
+    // Спуск к указанному ребенку
     pub fn go_to_subgroup(self: &Arc<Self>, key: &K) -> Option<Arc<Self>> {
-        if let Some(subgroup) = self.get_subgroup(key) {
-            Some(subgroup)
-        } else {
-            None
-        }
+        self.get_subgroup(key)
     }
 
-    // Возвращаемся в начало и чисти все данные
+    // Возврат в корень с очисткой всех промежуточных данных
     pub fn go_to_root(self: &Arc<Self>) -> Arc<Self> {
         let mut current = Arc::clone(self);
         while let Some(parent) = current.go_to_parent() {
@@ -244,12 +152,12 @@ where
         current
     }
 
-    // Проверка что наш уровень - начало
+    // Проверка что текущий узел - корень
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
     }
 
-    // Получаем абсолютный путь где мы находимся сейчас (Хлебные крошки)
+    // Получить абсолютный путь от корня до текущего узла (breadcrumbs)
     pub fn get_path(&self) -> Vec<K> {
         let mut path = Vec::new();
         let mut current_weak = self.parent.clone();
@@ -268,62 +176,43 @@ where
         path
     }
 
-    // Получаем конкретного ребенка
+    // Получить конкретную подгруппу по ключу
     pub fn get_subgroup(&self, key: &K) -> Option<Arc<GroupData<K, V>>> {
         self.subgroups.load().get(key).map(Arc::clone)
     }
 
-    // Получучаем ключи от всех наших детей
+    // Получить ключи всех подгрупп
     pub fn subgroups_keys(&self) -> Vec<K> {
         self.subgroups.load().keys().cloned().collect()
     }
 
-    // Количество детей
+    // Количество подгрупп
     pub fn subgroups_count(&self) -> usize {
         self.subgroups.load().len()
     }
 
-    // Получаем всех наши детей
+    // Получить все подгруппы
     pub fn get_all_subgroups(&self) -> Vec<Arc<GroupData<K, V>>> {
         self.subgroups.load().values().cloned().collect()
     }
 
-    // Очищаем всех наших детей (рекурсивно)
-    // ВНИАНИЕ: Очищаем горизонтальные связи между детьми!
+    // Очистить все подгруппы рекурсивно
     pub fn clear_subgroups(&self) {
         let current_subgroups = self.subgroups.load();
         
+        // Рекурсивно очищаем детей
         for (_, subgroup) in current_subgroups.iter() {
-            // Очищаем связи между relatives
-            subgroup.prev_relative.store(Arc::new(None));
-            subgroup.next_relative.store(Arc::new(None));
-            
-            // Рекурсивно очищаем детей
             subgroup.clear_subgroups();
         }
         
         let _guard = self.write_lock.lock();
-        self.subgroups.store(Arc::new(BTreeMap::new()));
+        self.subgroups.store(Arc::new(HashMap::new()));
     }
 
-    // Обойти всё дерево
-    pub fn traverse<F>(&self, callback: &F)
-    where
-        F: Fn(&Arc<GroupData<K, V>>) + Sync,
+    // Обойти всё дерево последовательно
+    pub fn traverse(self: &Arc<Self>, callback: &impl Fn(&Arc<GroupData<K, V>>))
     {
-        let self_arc = Arc::new(Self {
-            key: self.key.clone(),
-            data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
-            subgroups: ArcSwap::new(self.subgroups.load_full()),
-            prev_relative: ArcSwap::new(self.prev_relative.load_full()),
-            next_relative: ArcSwap::new(self.next_relative.load_full()),
-            description: self.description.clone(),
-            depth: self.depth,
-            write_lock: Mutex::new(()),
-        });
-        
-        callback(&self_arc);
+        callback(self);
         
         let subgroups = self.subgroups.load();
         for (_, subgroup) in subgroups.iter() {
@@ -331,24 +220,12 @@ where
         }
     }
 
-    // Параллельный обход дерева
-    pub fn traverse_parallel<F>(&self, callback: &F)
+    // Обойти всё дерево параллельно
+    pub fn traverse_parallel<F>(self: &Arc<Self>, callback: &F)
     where
         F: Fn(&Arc<GroupData<K, V>>) + Sync + Send,
     {
-        let self_arc = Arc::new(Self {
-            key: self.key.clone(),
-            data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
-            subgroups: ArcSwap::new(self.subgroups.load_full()),
-            prev_relative: ArcSwap::new(self.prev_relative.load_full()),
-            next_relative: ArcSwap::new(self.next_relative.load_full()),
-            description: self.description.clone(),
-            depth: self.depth,
-            write_lock: Mutex::new(()),
-        });
-        
-        callback(&self_arc);
+        callback(self);
         
         let subgroups_vec: Vec<_> = self.subgroups.load().values().cloned().collect();
         
@@ -357,37 +234,22 @@ where
         });
     }
 
-    // Собрать всех детей (рекурсивно)
-    pub fn collect_all_groups(&self) -> Vec<Arc<GroupData<K, V>>> {
+    // Собрать все группы рекурсивно
+    pub fn collect_all_groups(self: &Arc<Self>) -> Vec<Arc<GroupData<K, V>>> {
         let mut result = Vec::new();
         self.collect_recursive(&mut result);
         result
     }
 
-    // Рекурсивный сбор детей
-    fn collect_recursive(&self, result: &mut Vec<Arc<GroupData<K, V>>>) {
-        // Создаем Arc текущей родителя
-        let self_arc = Arc::new(Self {
-            key: self.key.clone(),
-            data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
-            subgroups: ArcSwap::new(self.subgroups.load_full()),
-            prev_relative: ArcSwap::new(self.prev_relative.load_full()),
-            next_relative: ArcSwap::new(self.next_relative.load_full()),
-            description: self.description.clone(),
-            depth: self.depth,
-            write_lock: parking_lot::Mutex::new(()),
-        });
+    fn collect_recursive(self: &Arc<Self>, result: &mut Vec<Arc<GroupData<K, V>>>) {
+        result.push(Arc::clone(self));
         
-        result.push(self_arc);
-        
-        // Рекурсивно собираем детей
         for subgroup in self.get_all_subgroups() {
             subgroup.collect_recursive(result);
         }
     }
 
-    // Текущая максимальная глубина
+    // Максимальная глубина дерева
     pub fn max_depth(&self) -> usize {
         let subgroups = self.subgroups.load();
         if subgroups.is_empty() {
@@ -400,7 +262,7 @@ where
         }
     }
 
-    // Общее количество детей
+    // Общее количество групп в дереве
     pub fn total_groups_count(&self) -> usize {
         let subgroups = self.subgroups.load();
         1 + subgroups.values()
@@ -408,6 +270,7 @@ where
             .sum::<usize>()
     }
 
+    // Фильтрация данных в текущей группе
     pub fn filter<F>(&self, predicate: F)
     where
         F: Fn(&V) -> bool + Sync + Send,
@@ -415,10 +278,12 @@ where
         self.data.filter(predicate);
     }
 
+    // Сброс фильтров к исходным данным
     pub fn reset_filters(&self) {
         self.data.reset_to_source();
     }
 
+    // Фильтрация всех подгрупп
     pub fn filter_subgroups<F>(&self, predicate: F)
     where
         F: Fn(&V) -> bool + Sync + Send + Clone,
@@ -429,18 +294,12 @@ where
         });
     }
 
-    // Дебажим наше дереров    
+    // Вывод дерева в консоль для отладки
     pub fn print_tree(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
         
-        let relative_info = format!(
-            " [prev: {}, next: {}]",
-            if self.has_prev_relative() { "yes" } else { "no" },
-            if self.has_next_relative() { "yes" } else { "no" }
-        );
-        
-        println!("{}📁 {:?} ({} items, depth: {}){}", 
-                 prefix, self.key, self.data.len(), self.depth, relative_info);
+        println!("{}📁 {:?} ({} items, depth: {})", 
+                 prefix, self.key, self.data.len(), self.depth);
         
         let subgroups = self.subgroups.load();
         for (_, subgroup) in subgroups.iter() {
@@ -448,21 +307,19 @@ where
         }
     }
 
-    // Дебажим где мы находимся
+    // Вывод информации о текущей группе
     pub fn print_info(&self) {
         println!("\n📊 Group: {:?}", self.key);
         println!("  Path: {:?}", self.get_path());
         println!("  Items: {}", self.data.len());
         println!("  Depth: {}", self.depth);
         println!("  Is root: {}", self.is_root());
-        println!("  Has prev relative: {}", self.has_next_relative());
-        println!("  Has next relative: {}", self.has_next_relative());
         println!("  Subgroups: {}", self.subgroups_count());
         println!("  Max depth: {}", self.max_depth());
         println!("  Total groups: {}", self.total_groups_count());
     }
 
-    // текущая глубина
+    // Текущая глубина узла
     pub fn depth(&self) -> usize {
         self.depth
     }
@@ -474,7 +331,7 @@ pub struct FilterGroup;
 impl FilterGroup {
     pub fn filter_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>)
     where
-        K: Ord + Clone + std::fmt::Debug + Send + Sync,
+        K: Ord + Hash + Clone + Debug + Send + Sync,
         V: Send + Sync + Clone,
         F: Fn(&V) -> bool + Send + Sync,
     {   
@@ -485,7 +342,7 @@ impl FilterGroup {
 
     pub fn filter_subgroups_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>)
     where
-        K: Ord + Clone + std::fmt::Debug + Send + Sync,
+        K: Ord + Hash + Clone + Debug + Send + Sync,
         V: Send + Sync + Clone,
         F: Fn(&V) -> bool + Send + Sync + Clone,
     {

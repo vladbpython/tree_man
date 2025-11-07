@@ -76,36 +76,6 @@ fn bench_get_subgroup(c: &mut Criterion) {
     });
 }
 
-fn bench_relatives_navigation(c: &mut Criterion) {
-    let products = create_products(100);
-    let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.brand.clone(), "Brands");
-    
-    let keys = root.subgroups_keys();
-    let first = root.get_subgroup(&keys[0]).unwrap();
-    
-    c.bench_function("go_to_next_relative", |b| {
-        b.iter(|| {
-            black_box(first.go_to_next_relative());
-        });
-    });
-}
-
-fn bench_has_relatives(c: &mut Criterion) {
-    let products = create_products(100);
-    let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.brand.clone(), "Brands");
-    
-    let keys = root.subgroups_keys();
-    let first = root.get_subgroup(&keys[0]).unwrap();
-    
-    c.bench_function("has_next_relative", |b| {
-        b.iter(|| {
-            black_box(first.has_next_relative());
-        });
-    });
-}
-
 fn bench_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("filter");
     
@@ -189,34 +159,6 @@ fn bench_concurrent_reads(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_concurrent_relative_navigation(c: &mut Criterion) {
-    let products = create_products(100);
-    let root = Arc::new(GroupData::new_root("Root".to_string(), products, "All"));
-    root.group_by(|p| p.brand.clone(), "Brands");
-    
-    let keys = root.subgroups_keys();
-    let first = root.get_subgroup(&keys[0]).unwrap();
-    
-    c.bench_function("concurrent_relative_navigation", |b| {
-        b.iter(|| {
-            let handles: Vec<_> = (0..10).map(|_| {
-                let group = Arc::clone(&first);
-                thread::spawn(move || {
-                    for _ in 0..100 {
-                        black_box(group.has_next_relative());
-                        black_box(group.has_prev_relative());
-                        black_box(group.go_to_next_relative());
-                    }
-                })
-            }).collect();
-            
-            for handle in handles {
-                handle.join().unwrap();
-            }
-        });
-    });
-}
-
 fn bench_parallel_filter(c: &mut Criterion) {
     let products = create_products(1000);
     let root = GroupData::new_root("Root".to_string(), products, "All");
@@ -289,13 +231,10 @@ criterion_group!(
     bench_group_creation,
     bench_group_by,
     bench_get_subgroup,
-    bench_relatives_navigation,
-    bench_has_relatives,
     bench_filter,
     bench_clear_subgroups,
     bench_collect_all_groups,
     bench_concurrent_reads,
-    bench_concurrent_relative_navigation,
     bench_parallel_filter,
     bench_memory_allocation,
     bench_deep_hierarchy,

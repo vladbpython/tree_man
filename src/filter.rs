@@ -1,18 +1,18 @@
 use super::model::MemoryStats;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
-};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
+
+const MAX_HISTORY: usize = 50;
+const MAX_RETRIES: usize = 3;
 
 pub struct FilterData<T>
 where
     T: Send + Sync,
 {
-    levels: ArcSwap<BTreeMap<usize, Arc<Vec<Arc<T>>>>>,
-    level_info: ArcSwap<BTreeMap<usize, String>>,
+    levels: ArcSwap<Vec<Arc<Vec<Arc<T>>>>>,
+    level_info: ArcSwap<Vec<Arc<str>>>,
     current_level: Arc<AtomicUsize>,
     // RwLock только для write операций (минимум contention)
     write_lock: RwLock<()>,
@@ -27,17 +27,14 @@ where
         
         let arc_items = match len {
             0..=499 => {
-                // Малые - последовательно
                 Arc::new(items.into_iter().map(Arc::new).collect())
             }
             500..=50_000 => {
-                // Средние - простой параллелизм
                 let mut arcs = Vec::with_capacity(len);
                 arcs.par_extend(items.into_par_iter().map(Arc::new));
                 Arc::new(arcs)
             }
             _ => {
-                // Большие - с чанками для лучшей локальности кэша
                 Arc::new(
                     items
                         .into_par_iter()
@@ -49,111 +46,116 @@ where
         };
         
         Self {
-            levels: ArcSwap::from_pointee(BTreeMap::from([(0, arc_items)])),
-            level_info: ArcSwap::from_pointee(BTreeMap::from([(0, "Source".to_string())])),
+            levels: ArcSwap::from_pointee(vec![arc_items]),
+            level_info: ArcSwap::from_pointee(vec![Arc::from("Source")]),
             current_level: Arc::new(AtomicUsize::new(0)),
             write_lock: RwLock::new(()),
         }
     }
 
-    pub fn from_vec_arc_value(items: Vec<Arc<T>>) -> Self{
-        let mut levels = BTreeMap::new();
-        levels.insert(0, Arc::new(items));
-        
-        let mut level_info = BTreeMap::new();
-        level_info.insert(0, "Source".to_string());
-        
+    pub fn from_vec_arc_value(items: Vec<Arc<T>>) -> Self {
         Self {
-            levels: ArcSwap::from_pointee(levels),
-            level_info: ArcSwap::from_pointee(level_info),
+            levels: ArcSwap::from_pointee(vec![Arc::new(items)]),
+            level_info: ArcSwap::from_pointee(vec![Arc::from("Source")]),
             current_level: Arc::new(AtomicUsize::new(0)),
             write_lock: RwLock::new(()),
         }
     }
 
-    pub fn filter<F>(&self, predicate: F) -> &Self
+    fn filter_impl<F>(&self, predicate: F, retry_count: usize) -> &Self
     where
         F: Fn(&T) -> bool + Sync + Send,
     {
+        if retry_count >= MAX_RETRIES {
+            #[cfg(debug_assertions)]
+            eprintln!("FilterData: max retries reached");
+            return self;
+        }
+
         // Шаг 1: Читаем данные БЕЗ блокировки 
         let (current_lvl, current_data) = {
             let current_lvl = self.current_level.load(Ordering::Acquire);
-            let levels_guard = self.levels.load(); // ← Дешёвый load, не load_full
-            let current_data = match levels_guard.get(&current_lvl) {
-                Some(data) => Arc::clone(data),
-                None => Arc::clone(levels_guard.get(&0).expect("Oops level 0 must always exist")),
-            };
+            let levels_guard = self.levels.load();
             
-            (current_lvl, current_data)
-        }; // Guard автоматически освобождается
+            let current_data = levels_guard
+                .get(current_lvl)
+                .or_else(|| levels_guard.first())
+                .expect("Oops Level 0 must exist");
+            
+            (current_lvl, Arc::clone(current_data))
+        };
         
-        // Шаг 2: Фильтрация БЕЗ блокировок (параллельная обработка)
+        // Шаг 2: Параллельная фильтрация
         let filtered: Vec<Arc<T>> = current_data
             .par_iter()
             .filter(|item| predicate(item))
             .cloned()
             .collect();
         
-        // Фаза 3: Обновление (короткая критическая секция)
+        // Шаг 3: Обновление
         {
             let _guard = self.write_lock.write();
             
-            // Ещё раз проверяем current_level под блокировкой
             let actual_current = self.current_level.load(Ordering::Acquire);
             if actual_current != current_lvl {
-                // Уровень изменился - нужно retry
                 drop(_guard);
-                return self.filter(predicate);
+                return self.filter_impl(predicate, retry_count + 1);
             }
             
-            let new_level = current_lvl + 1;
-            
-            // Эффективное создание нового BTreeMap через итератор
             let levels_guard = self.levels.load();
-            let new_levels: BTreeMap<_, _> = levels_guard
-                .iter()
-                .filter(|&(&k, _)| k <= current_lvl)
-                .map(|(&k, v)| (k, Arc::clone(v)))
-                .chain(std::iter::once((new_level, Arc::new(filtered))))
-                .collect();
             
+            // просто копируем Vec до нужного уровня
+            let mut new_levels = if levels_guard.len() < MAX_HISTORY {
+                // Копируем все + добавляем новый
+                levels_guard.to_vec()
+            } else {
+                // Cleanup: берём последние MAX_HISTORY-1 уровней
+                let start = levels_guard.len().saturating_sub(MAX_HISTORY - 1);
+                levels_guard[start..].to_vec()
+            };
+            
+            new_levels.push(Arc::new(filtered));
+            
+            // Вычисляем длину ДО перемещения в Arc
+            let adjusted_level = new_levels.len() - 1;
+            
+            // Теперь перемещаем
             self.levels.store(Arc::new(new_levels));
             
-            // Обновляем level_info
+            // level_info аналогично
             let info_guard = self.level_info.load();
-            let new_info: BTreeMap<_, _> = info_guard
-                .iter()
-                .filter(|&(&k, _)| k <= current_lvl)
-                .map(|(&k, v)| (k, v.clone()))
-                .chain(std::iter::once((new_level, "Filtered".to_string())))
-                .collect();
+            let mut new_info = if info_guard.len() < MAX_HISTORY {
+                info_guard.to_vec()
+            } else {
+                let start = info_guard.len().saturating_sub(MAX_HISTORY - 1);
+                info_guard[start..].to_vec()
+            };
+            new_info.push(Arc::from("Filtered"));
             self.level_info.store(Arc::new(new_info));
-            self.current_level.store(new_level, Ordering::Release);
             
+            // Устанавливаем current_level
+            self.current_level.store(adjusted_level, Ordering::Release);
         }
-        
         self
     }
 
-    // Cбросить все фильтры и вернуться к исходнику
+    pub fn filter<F>(&self, predicate: F) -> &Self
+    where
+        F: Fn(&T) -> bool + Sync + Send,
+    {
+        self.filter_impl(predicate, 0)
+    }
+
     pub fn reset_to_source(&self) -> &Self {
         let _guard = self.write_lock.write();
         
         let levels_guard = self.levels.load();
-        
-        // Создаём новый BTreeMap с только level 0
-        let mut new_levels = BTreeMap::new();
-        if let Some(level_0) = levels_guard.get(&0) {
-            new_levels.insert(0, Arc::clone(level_0));
+        if let Some(level_0) = levels_guard.first() {
+            self.levels.store(Arc::new(vec![Arc::clone(level_0)]));
         }
         
-        self.levels.store(Arc::new(new_levels));
+        self.level_info.store(Arc::new(vec![Arc::from("Source")]));
         self.current_level.store(0, Ordering::Release);
-        
-        // Обновляем level_info
-        let mut new_info = BTreeMap::new();
-        new_info.insert(0, "Source".to_string());
-        self.level_info.store(Arc::new(new_info));
         
         self
     }
@@ -163,31 +165,19 @@ where
         
         let levels_guard = self.levels.load();
         
-        if !levels_guard.contains_key(&target_level) {
-            println!("no key");
-            return self;
+        if target_level >= levels_guard.len() {
+            return self; // Недопустимый уровень
         }
         
-        // Эффективное создание через итератор
-        let new_levels: BTreeMap<_, _> = levels_guard
-            .iter()
-            .filter(|&(&k, _)| k <= target_level)
-            .map(|(&k, v)| (k, Arc::clone(v)))
-            .collect();
-        
+        // Просто обрезаем Vec
+        let new_levels = levels_guard[..=target_level].to_vec();
         self.levels.store(Arc::new(new_levels));
-        self.current_level.store(target_level, Ordering::Release);
         
-        // Обновляем level_info
         let info_guard = self.level_info.load();
-        println!("keys: {:?}",info_guard.keys());
-        let new_info: BTreeMap<_, _> = info_guard
-            .iter()
-            .filter(|&(&k, _)| k <= target_level)
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-        
+        let new_info = info_guard[..=target_level].to_vec();
         self.level_info.store(Arc::new(new_info));
+        
+        self.current_level.store(target_level, Ordering::Release);
         
         self
     }
@@ -205,10 +195,12 @@ where
         let current_lvl = self.current_level.load(Ordering::Acquire);
         let levels_guard = self.levels.load();
         
-        match levels_guard.get(&current_lvl) {
-            Some(data) => Arc::clone(data),
-            None => Arc::clone(levels_guard.get(&0).expect("Oops level 0 must always exist")),
-        }
+        // O(1) доступ!
+        Arc::clone(
+            levels_guard
+                .get(current_lvl)
+                .unwrap_or_else(|| levels_guard.first().expect("Oops Level 0 must exist"))
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -229,7 +221,7 @@ where
 
     pub fn total_stored_items(&self) -> usize {
         self.levels.load()
-            .values()
+            .iter()
             .map(|level| level.len())
             .sum()
     }
@@ -247,15 +239,15 @@ where
             wasted_items: 0,
         };
 
-        for (lvl, level_data) in levels_guard.iter() {
+        for (idx, level_data) in levels_guard.iter().enumerate() {
             let count = level_data.len();
             stats.total_stored_items += count;
             
-            if *lvl == current_lvl {
+            if idx == current_lvl {
                 stats.current_level_items = count;
             }
             
-            if *lvl <= current_lvl {
+            if idx <= current_lvl {
                 stats.useful_items += count;
             } else {
                 stats.wasted_items += count;
@@ -263,9 +255,12 @@ where
         }
         stats
     }
+    
+    pub fn level_name(&self, level: usize) -> Option<Arc<str>> {
+        let info_guard = self.level_info.load();
+        info_guard.get(level).map(Arc::clone)
+    }
 }
-
-
 
 pub trait IntoFilterData {
     type Item: Send + Sync;
