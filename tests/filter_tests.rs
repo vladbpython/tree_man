@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests{
+    use rust_decimal::{Decimal, prelude::FromPrimitive};
     use tree_man::filter::IntoFilterData;
     use std::{
         sync::{
@@ -35,6 +36,37 @@ mod tests{
     }
 
     #[test]
+    fn test_filtered_decimal_collection_filter() {
+        let data = vec![
+            Decimal::from_u8(1).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(2).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(3).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(4).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(5).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(6).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(7).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(8).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(9).unwrap_or(Decimal::ZERO), 
+            Decimal::from_u8(10).unwrap_or(Decimal::ZERO)
+        ];
+        let filtered = data.into_filtered();
+        
+        filtered.filter(|x| *x > Decimal::from_u8(5).unwrap_or(Decimal::ZERO));
+        
+        assert_eq!(filtered.len(), 5);
+        assert_eq!(filtered.current_level(), 1);
+    }
+
+     #[test]
+    fn test_filtered_float64_collection_filter() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let filtered = data.into_filtered();
+        filtered.create_bucketed_float_index_f64("big", |x| *x, 10.0);
+        let result = filtered.filter_by_bucketed_float_range_f64("big", 5.1..,10.0);
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
     fn test_filtered_collection_multiple_filters() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let filtered = data.into_filtered();
@@ -58,7 +90,7 @@ mod tests{
         
         assert_eq!(filtered.current_level(), 2);
         
-        filtered.go_to_level(1);
+        filtered.up();
         assert_eq!(filtered.current_level(), 1);
         assert_eq!(filtered.len(), 5);
         
@@ -170,12 +202,10 @@ mod tests{
         filtered.filter(|_| true);  // Level 5
         
         assert_eq!(filtered.stored_levels_count(), 6); // 0-5
+        filtered.up();
         
-        // Переходим к уровню 2 - должны очиститься 3, 4, 5
-        filtered.go_to_level(2);
-        
-        assert_eq!(filtered.stored_levels_count(), 3); // 0, 1, 2
-        assert_eq!(filtered.current_level(), 2);
+        assert_eq!(filtered.stored_levels_count(), 5);
+        assert_eq!(filtered.current_level(), 4);
         
         let stats = filtered.memory_stats();
         assert!(stats.is_clean());
@@ -247,7 +277,7 @@ mod tests{
         assert!(stats.is_clean());
         
         // Возвращаемся назад
-        filtered.go_to_level(1);
+        filtered.up();
         
         let stats = filtered.memory_stats();
         assert_eq!(stats.stored_levels, 2);
@@ -268,7 +298,8 @@ mod tests{
         assert_eq!(filtered.stored_levels_count(), 4);
         
         // Возвращаемся к level 1
-        filtered.go_to_level(1);
+        filtered.up();
+        filtered.up();
         assert_eq!(filtered.stored_levels_count(), 2);
         
         // Применяем новый фильтр от level 1
@@ -308,7 +339,8 @@ mod tests{
         filtered.filter(|d| d._id > 400);   // Level 2
         filtered.filter(|d| d._id > 600);   // Level 3
         
-        filtered.go_to_level(1);              // Очистка 2, 3
+        filtered.up();
+        filtered.up();
         assert_eq!(filtered.stored_levels_count(), 2);
         
         filtered.filter(|d| d._id < 500);   // Новый Level 2
@@ -376,7 +408,8 @@ mod tests{
         assert!(stats.is_clean());
         
         // Возвращаемся на level 1
-        filtered.go_to_level(1);
+        filtered.up();
+        filtered.up();
         
         let stats = filtered.memory_stats();
         println!("After goto level 1: {:?}", stats);
@@ -460,8 +493,6 @@ mod tests{
             }
             
             // Навигация туда-сюда
-            filtered.go_to_level(5);
-            filtered.go_to_level(2);
             filtered.reset_to_source();
             filtered.filter(|_| true);
             filtered.up();
@@ -561,7 +592,8 @@ mod tests{
         
         assert_eq!(filtered.stored_levels_count(), 4);
         
-        filtered.go_to_level(1);
+        filtered.up();
+        filtered.up();
         assert_eq!(filtered.stored_levels_count(), 2);
         
         let stats = filtered.memory_stats();

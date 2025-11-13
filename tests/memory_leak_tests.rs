@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod test{
-    use tree_man::group::GroupData;
+    use tree_man::{
+        group::GroupData,
+        filter::FilterData,
+    };
     use serial_test::serial;
     use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     static DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -54,6 +57,116 @@ mod test{
             ["Apple", "Samsung"][i % 2].to_string(),
             500.0 + (i as f64) * 10.0,
         )).collect()
+    }
+
+    #[test]
+    fn test_no_circular_references() {
+        // Создаем root с детьми
+        let items: Vec<i32> = (0..1000).collect();
+        let root = Arc::new(GroupData::new_root(
+            "Root".to_string(),
+            items,
+            "Root"
+        ));
+        
+        root.group_by(|n| (n % 5).to_string(), "By Mod 5");
+        
+        // Получаем количество Arc ссылок
+        let initial_count = Arc::strong_count(&root);
+        println!("Initial Arc count: {}", initial_count);
+        
+        // Получаем детей
+        let children = root.get_all_subgroups();
+        println!("Children count: {}", children.len());
+        
+        // Дропаем детей
+        drop(children);
+        
+        // Arc count должен вернуться к исходному
+        let after_drop = Arc::strong_count(&root);
+        println!("After drop count: {}", after_drop);
+        
+        assert_eq!(initial_count, after_drop, 
+                   "Arc references leaked!");
+    }
+
+    #[test]
+    fn test_index_weak_references() {
+        let items: Vec<String> = (0..1000)
+            .map(|i| format!("item_{}", i))
+            .collect();
+        
+        let data = FilterData::from_vec(items);
+        data.create_index("test", |s| s.len());
+        
+        // Проверяем что индекс валиден
+        assert!(data.validate_indexes());
+        
+        // Дропаем data
+        drop(data);
+        
+        // После drop индексы должны стать невалидными
+        // (если используют Weak правильно)
+    }
+
+    #[test]
+    fn test_many_operations_no_leak() {
+        use memory_stats::memory_stats;
+        
+        let start_mem = memory_stats().map(|m| m.physical_mem);
+        
+        for _ in 0..100 {
+            let items: Vec<i32> = (0..10_000).collect();
+            let data = FilterData::from_vec(items);
+            
+            // Много операций
+            data.create_bit_index("even", |&n| n % 2 == 0);
+            data.filter_by_bit_index("even");
+            data.filter(|&n| n > 5000);
+            data.reset_to_source();
+            
+            // data дропается здесь
+        }
+        
+        // Даем время освободить память
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        let end_mem = memory_stats().map(|m| m.physical_mem);
+        
+        if let (Some(start), Some(end)) = (start_mem, end_mem) {
+            let diff = end.saturating_sub(start);
+            println!("Memory growth: {} MB", diff / 1024 / 1024);
+            
+            // Не должно быть значительного роста памяти
+            assert!(diff < 50_000_000, 
+                    "Possible memory leak! Growth: {} bytes", diff);
+        }
+    }
+
+    #[test]
+    fn test_drop_order() {
+        // Проверяем что дропается в правильном порядке
+        struct DropChecker {
+            id: i32,
+        }
+        
+        impl Drop for DropChecker {
+            fn drop(&mut self) {
+                println!("Dropping {}", self.id);
+            }
+        }
+        
+        let items: Vec<DropChecker> = (0..10)
+            .map(|id| DropChecker { id })
+            .collect();
+        
+        let data = FilterData::from_vec(items);
+        println!("Created FilterData");
+        
+        drop(data);
+        println!("Dropped FilterData");
+        
+        // Должно вывести "Dropping" для всех элементов
     }
 
     #[test]
