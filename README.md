@@ -749,6 +749,7 @@ Found 8 outliers among 100 measurements (8.00%)
 ```
 
 ## Backtest
+### 1_000_000 candles
 
 ```matlab
 
