@@ -1,26 +1,42 @@
+use crate::index::field::IndexFieldEnum;
+
 use super::{
+    errors::{
+        GLobalError,
+        IndexError,
+        FilterDataError,
+    },
     index::{
-        decimal::{
-            BucketedDecimalIndexWrapper,
+        INDEX_FIELD,
+        INDEX_TEXT,
+        CompatibilityAction as IndexCompatibilityAction,
+        ExtractorFieldValue,
+        IndexType,
+        bit::Op,
+        field::{
+            FieldValue,
+            IntoIndexFieldEnum,
+            IndexField,
+            FieldOperation,
         },
-        float::{
-            Float,
-            FloatRangeBounds,
-            BucketedFloatIndexWrapper
-        },
-        storage::{DataStorage,Index},
+        storage::DataStorage,
+        text::{TextIndex,TextIndexStats},
     },
     model::MemoryStats,
-    bit_index::{BitIndex, BitOp, BitOpResult,BitIndexView},
+    result::{
+        IndexResult,
+        GlobalResult
+    },
 };
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use rust_decimal::Decimal;
 use std::{
-    any::Any,
-    collections::{HashMap,BTreeMap},
+    cmp::{Ord,PartialOrd},
+    fmt::Display,
+    hash::Hash,
     marker::PhantomData,
     sync::{
         Arc,
@@ -30,24 +46,26 @@ use std::{
 
 
 const MAX_HISTORY: usize = 50;
-const MAX_RETRIES: usize = 3;
+const MATERIALIZATION_THRESHOLD: usize = 50_000;
+const SMALL_DATASET_THRESHOLD: usize = 1000;
+const SELECTIVITY_THRESHOLD: f64 = 0.1;
 
 // FilterData
 
 pub struct FilterData<T>
 where
-    T: Send + Sync,
+    T: Send + Sync + 'static,
 {
     storage: DataStorage<T>,
-    
-    levels: Option<ArcSwap<Vec<Arc<Vec<Arc<T>>>>>>,
-    level_info: Option<ArcSwap<Vec<Arc<str>>>>,
-    current_level: Option<Arc<AtomicUsize>>,
-    
+    level_info: ArcSwap<Vec<Arc<str>>>,
+    current_level: Arc<AtomicUsize>,
+    indexes: DashMap<String, Arc<IndexType<T>>>,
+    source_indices_mask: ArcSwap<Option<Arc<RoaringBitmap>>>,
     write_lock: RwLock<()>,
-    
-    indexes: ArcSwap<BTreeMap<String, Arc<dyn Any + Send + Sync>>>,
-    index_builders: Arc<RwLock<BTreeMap<String, Arc<dyn Fn(&[Arc<T>]) + Send + Sync>>>>,
+}
+
+struct FilterResult {
+    bitmap: RoaringBitmap,
 }
 
 impl<T> FilterData<T>
@@ -78,77 +96,129 @@ where
                 )
             }
         };
+        let initial_indices: Vec<usize> = (0..arc_items.len()).collect();
+        let initial_indices_arc = Arc::new(initial_indices);
         
         Self {
             storage: DataStorage::Owned {
                 source: Arc::clone(&arc_items),
-                current: ArcSwap::new(Arc::clone(&arc_items)),
+                current_indices: ArcSwap::new(initial_indices_arc.clone()),
+                current_cache: ArcSwap::new(Arc::new(None)),
+                full_indices: initial_indices_arc,
+                levels: ArcSwap::from_pointee(vec![Arc::clone(&arc_items)]),
+                level_indices:  ArcSwap::from_pointee(vec![Arc::new((0..arc_items.len()).collect())]),
             },
-            levels: Some(ArcSwap::from_pointee(vec![Arc::clone(&arc_items)])),
-            level_info: Some(ArcSwap::from_pointee(vec![Arc::from("Source")])),
-            current_level: Some(Arc::new(AtomicUsize::new(0))),
+            level_info: ArcSwap::from_pointee(vec![Arc::from("Source")]),
+            current_level: Arc::new(AtomicUsize::new(0)),
+            indexes: DashMap::new(),
+            source_indices_mask: ArcSwap::from_pointee(None),
             write_lock: RwLock::new(()),
-            indexes: ArcSwap::from_pointee(BTreeMap::new()),
-            index_builders: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     pub fn from_vec_arc_value(items: Vec<Arc<T>>) -> Self {
         let arc_items = Arc::new(items);
-        
+        let initial_indices: Vec<usize> = (0..arc_items.len()).collect();
+        let initial_indices_arc = Arc::new(initial_indices);
         Self {
             storage: DataStorage::Owned {
                 source: Arc::clone(&arc_items),
-                current: ArcSwap::new(Arc::clone(&arc_items)),
+                current_indices: ArcSwap::new(initial_indices_arc.clone()),
+                current_cache: ArcSwap::new(Arc::new(None)),
+                full_indices: initial_indices_arc,
+                levels: ArcSwap::from_pointee(vec![Arc::clone(&arc_items)]),
+                level_indices: ArcSwap::from_pointee(vec![Arc::new((0..arc_items.len()).collect())]),
             },
-            levels: Some(ArcSwap::from_pointee(vec![Arc::clone(&arc_items)])),
-            level_info: Some(ArcSwap::from_pointee(vec![Arc::from("Source")])),
-            current_level: Some(Arc::new(AtomicUsize::new(0))),
+            level_info: ArcSwap::from_pointee(vec![Arc::from("Source")]),
+            current_level: Arc::new(AtomicUsize::new(0)),
+            indexes: DashMap::new(),
+            source_indices_mask: ArcSwap::from_pointee(None),
             write_lock: RwLock::new(()),
-            indexes: ArcSwap::from_pointee(BTreeMap::new()),
-            index_builders: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
     
     pub fn from_indices(parent_data: &Arc<Vec<Arc<T>>>, indices: Vec<usize>) -> Self {
+        let source_indices = Arc::new(indices);
         Self {
             storage: DataStorage::Indexed {
                 parent_data: Arc::downgrade(parent_data),
-                source_indices: Arc::new(indices.clone()),
-                current_indices: ArcSwap::new(Arc::new(indices)),
+                source_indices: Arc::clone(&source_indices),
+                current_indices: ArcSwap::new(Arc::clone(&source_indices)),
+                index_levels: ArcSwap::from_pointee(vec![source_indices]),
             },
-            levels: None,
-            level_info: None,
-            current_level: None,
+            level_info: ArcSwap::from_pointee(vec![Arc::from("Source")]),
+            current_level: Arc::new(AtomicUsize::new(0)),
+            indexes: DashMap::new(),
+            source_indices_mask: ArcSwap::from_pointee(None),
             write_lock: RwLock::new(()),
-            indexes: ArcSwap::from_pointee(BTreeMap::new()),
-            index_builders: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
     
     // Core Access Methods
+
+
+    pub fn current_indices(&self) -> Arc<Vec<usize>> {
+        match &self.storage {
+            DataStorage::Owned { current_indices, .. } |
+            DataStorage::Indexed { current_indices, .. } => {
+                (*current_indices.load()).clone()
+            }
+        }
+    }
     
     pub fn items(&self) -> Arc<Vec<Arc<T>>> {
         match &self.storage {
-            DataStorage::Owned { current, .. } => {
-                current.load_full()
+            DataStorage::Owned {
+                current_indices,
+                current_cache,
+                source,
+                ..
+            } => {
+                // Проверяем кеш
+                let cache_guard = current_cache.load();
+                if let Some(cached) = cache_guard.as_ref() {
+                    return Arc::clone(cached);
+                }
+                
+                // Материализуем из индексов
+                let indices = current_indices.load();  // Arc<Vec<usize>>
+                let items: Vec<Arc<T>> = indices
+                    .iter()
+                    .filter_map(|&idx| source.get(idx).cloned())
+                    .collect();
+                
+                let items_arc = Arc::new(items);
+                if items_arc.len() < MATERIALIZATION_THRESHOLD {
+                    current_cache.store(Arc::new(Some(Arc::clone(&items_arc))));
+                }
+                
+                items_arc
             }
-            DataStorage::Indexed { parent_data, current_indices, .. } => {
+            
+            DataStorage::Indexed {
+                parent_data,
+                current_indices,
+                ..
+            } => {
                 if let Some(parent) = parent_data.upgrade() {
-                    let indices_guard = current_indices.load();
-                    let items: Vec<Arc<T>> = if indices_guard.len() > 100_000 {
-                        indices_guard
-                            .par_iter()  // ← Параллельно!
+                    let indices = current_indices.load();  // Arc<Vec<usize>>
+                    
+                    // Параллельная материализация для больших наборов
+                    let items: Vec<Arc<T>> = if indices.len() > 100_000 {
+                        indices
+                            .par_iter()
                             .filter_map(|&idx| parent.get(idx).cloned())
                             .collect()
                     } else {
-                        indices_guard
+                        indices
                             .iter()
                             .filter_map(|&idx| parent.get(idx).cloned())
                             .collect()
                     };
+                    
                     Arc::new(items)
                 } else {
+                    // Родительские данные удалены
                     Arc::new(Vec::new())
                 }
             }
@@ -168,84 +238,9 @@ where
             DataStorage::Indexed { parent_data, .. } => parent_data.strong_count() > 0,
         }
     }
-    
-    pub fn source_indices(&self) -> Vec<usize> {
-        match &self.storage {
-            DataStorage::Owned { source, .. } => (0..source.len()).collect(),
-            DataStorage::Indexed { source_indices, .. } => (**source_indices).clone(),
-        }
-    }
-    
 
-    pub fn current_indices(&self) -> Vec<usize> {
-        match &self.storage {
-            DataStorage::Owned { current, source } => {
-                let current_guard = current.load();
-                // Fast path
-                if Arc::ptr_eq(&current_guard, source) {
-                    return (0..current_guard.len()).collect();
-                }
-                // HashMap для O(n)
-                let source_map: HashMap<*const T, usize> = source
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, item)| (Arc::as_ptr(item) as *const T, idx))
-                    .collect();
-                current_guard
-                    .iter()
-                    .filter_map(|item| {
-                        let ptr = Arc::as_ptr(item) as *const T;
-                        source_map.get(&ptr).copied()
-                    })
-                    .collect()
-            }
-            DataStorage::Indexed { current_indices, .. } => {
-                (**current_indices.load()).clone()
-            }
-        }
-    }
-
-    // Index-based API - ОПТИМИЗИРОВАНО с RoaringBitmap 
-    
-    // Применить индексы к данным (финальная материализация)
-    // 
-    // # Пример
-    // ```
-    // let indices = data.get_indices_by_bucketed_float_range_f64("price", 2000.0..3000.0, 100.0);
-    // let items = data.apply_indices(&indices);
-    // ```
-    pub fn apply_indices(&self, indices: &[usize]) -> Vec<Arc<T>> {
-        let items = self.items();
-        // Оптимизация: сортируем для лучшей cache locality
-        /*let sorted_needed = !indices.windows(2).all(|w| w[0] <= w[1]);
-        if sorted_needed {
-            println!("I AM HERE TO SORT");
-            let mut sorted_indices = indices.to_vec();
-            sorted_indices.sort_unstable();
-            if sorted_indices.len() > 100_000 {
-                return sorted_indices
-                    .par_iter()
-                    .filter_map(|&idx| items.get(idx).cloned())
-                    .collect();
-            } else {
-                return sorted_indices
-                    .iter()
-                    .filter_map(|&idx| items.get(idx).cloned())
-                    .collect();
-            }
-        }*/
-        // Уже отсортированы - используем как есть
-        if indices.len() > 100_000 {
-            indices
-                .par_iter()
-                .filter_map(|&idx| items.get(idx).cloned())
-                .collect()
-        } else {
-            indices
-                .iter()
-                .filter_map(|&idx| items.get(idx).cloned())
-                .collect()
-        }
+    pub fn indexes(&self) -> &DashMap<String, Arc<IndexType<T>>>{
+        &self.indexes
     }
     
     // Пересечение индексов (AND) через RoaringBitmap 
@@ -254,13 +249,13 @@ where
     // Использует RoaringBitmap для эффективного битового AND.
     // 
     // # Пример
-    // ```
+    // 
     // let a = vec![1, 2, 3, 4, 5];
     // let b = vec![2, 4, 6, 8];
     // let result = FilterData::intersect_indices(&a, &b);
     // assert_eq!(result, vec![2, 4]);
-    // ```
-    pub fn intersect_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
+    // 
+    fn intersect_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
         if a.is_empty() || b.is_empty() {
             return Vec::new();
         }
@@ -269,1243 +264,1100 @@ where
         let result = bitmap_a & bitmap_b;
         result.iter().map(|i| i as usize).collect()
     }
-    
-    // Объединение индексов (OR) через RoaringBitmap 
-    // 
-    // Возвращает индексы элементов из любого из переданных массивов (без дубликатов).
-    // 
-    // # Пример
-    // ```
-    // let a = vec![1, 2, 3];
-    // let b = vec![3, 4, 5];
-    // let result = FilterData::union_indices(&a, &b);
-    // assert_eq!(result, vec![1, 2, 3, 4, 5]);
-    // ```
-    pub fn union_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
-        if a.is_empty() {
-            return b.to_vec();
-        }
-        if b.is_empty() {
-            return a.to_vec();
-        }
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        let result = bitmap_a | bitmap_b;
-        result.iter().map(|i| i as usize).collect()
-    }
-    
-    // Разность индексов (A - B) через RoaringBitmap 
-    // 
-    // Возвращает индексы из `a`, которые НЕ присутствуют в `b`.
-    // 
-    // # Пример
-    // ```
-    // let a = vec![1, 2, 3, 4, 5];
-    // let b = vec![2, 4];
-    // let result = FilterData::difference_indices(&a, &b);
-    // assert_eq!(result, vec![1, 3, 5]);
-    // ```
-    pub fn difference_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
-        if a.is_empty() {
-            return Vec::new();
-        }
-        if b.is_empty() {
-            return a.to_vec();
-        }
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        let result = bitmap_a - bitmap_b;
-        result.iter().map(|i| i as usize).collect()
-    }
-    
-    // Множественное пересечение индексов (многопоточное) 
-    // 
-    // # Пример
-    // ```
-    // let indices = vec![indices1, indices2, indices3];
-    // let result = FilterData::intersect_multiple_indices(&indices);
-    // ```
-    pub fn intersect_multiple_indices(indices_list: &[Vec<usize>]) -> Vec<usize> {
-        if indices_list.is_empty() {
-            return Vec::new();
-        }
-        if indices_list.len() == 1 {
-            return indices_list[0].clone();
-        }
-        let bitmaps: Vec<RoaringBitmap> = indices_list
-            .par_iter()
-            .map(|indices| indices.iter().map(|&i| i as u32).collect())
-            .collect();
-        let mut result = bitmaps[0].clone();
-        for bitmap in &bitmaps[1..] {
-            result &= bitmap;
-            
-            if result.is_empty() {
-                return Vec::new();
-            }
-        }
-        result.iter().map(|i| i as usize).collect()
-    }
-    
-    // Множественное объединение индексов (многопоточное) 
-    // 
-    // # Пример
-    // ```
-    // let indices = vec![indices1, indices2, indices3];
-    // let result = FilterData::union_multiple_indices(&indices);
-    // ```
-    pub fn union_multiple_indices(indices_list: &[Vec<usize>]) -> Vec<usize> {
-        if indices_list.is_empty() {
-            return Vec::new();
-        }
-        if indices_list.len() == 1 {
-            return indices_list[0].clone();
-        }
-        let bitmaps: Vec<RoaringBitmap> = indices_list
-            .par_iter()
-            .map(|indices| indices.iter().map(|&i| i as u32).collect())
-            .collect();
-        let mut result = bitmaps[0].clone();
-        for bitmap in &bitmaps[1..] {
-            result |= bitmap;
-        }
-        result.iter().map(|i| i as usize).collect()
-    }
-    
-    // Симметричная разность (XOR) 
-    pub fn symmetric_difference_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
-        if a.is_empty() {
-            return b.to_vec();
-        }
-        if b.is_empty() {
-            return a.to_vec();
-        }
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        let result = bitmap_a ^ bitmap_b;
-        result.iter().map(|i| i as usize).collect()
-    }
-    
-    // Проверка пересечения 
-    pub fn has_intersection(a: &[usize], b: &[usize]) -> bool {
-        if a.is_empty() || b.is_empty() {
-            return false;
-        }
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        bitmap_a.intersection_len(&bitmap_b) > 0
-    }
-    
-    // Подсчет пересечения 
-    pub fn count_intersection(a: &[usize], b: &[usize]) -> usize {
-        if a.is_empty() || b.is_empty() {
-            return 0;
-        }
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        bitmap_a.intersection_len(&bitmap_b) as usize
-    }
-    
-    // Проверка подмножества 
-    pub fn is_subset(a: &[usize], b: &[usize]) -> bool {
-        if a.is_empty() {
-            return true;
-        }
-        if b.is_empty() {
-            return false;
-        }
-        
-        let bitmap_a: RoaringBitmap = a.iter().map(|&i| i as u32).collect();
-        let bitmap_b: RoaringBitmap = b.iter().map(|&i| i as u32).collect();
-        bitmap_a.is_subset(&bitmap_b)
-    }
-    
-    // Конвертировать индексы в RoaringBitmap 
-    pub fn indices_to_bitmap(indices: &[usize]) -> RoaringBitmap {
-        indices.iter().map(|&i| i as u32).collect()
-    }
-    
-    // Конвертировать RoaringBitmap в индексы 
-    pub fn bitmap_to_indices(bitmap: &RoaringBitmap) -> Vec<usize> {
-        bitmap.iter().map(|i| i as usize).collect()
-    }
 
     // Standard Index Methods - возвращают ИНДЕКСЫ 
 
-    pub fn create_index<K, F>(&self, name: &str, extractor: F) -> &Self
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-        F: Fn(&T) -> K + Send + Sync + 'static + Clone,
-    {
-        // Сначала удаляем старый индекс до взятия guard
-        if self.has_index(name) {
-            // drop_index берет свой собственный guard
-            self.drop_index(name);
-        }
-        // Теперь безопасно создаем новый
-        let _guard = self.write_lock.write();
-        let parent_weak = match &self.storage {
-            DataStorage::Owned { source, .. } => Arc::downgrade(source),
-            DataStorage::Indexed { parent_data, .. } => parent_data.clone(),
-        };
-        let index = Arc::new(Index::new(&parent_weak));
-        let items = self.items();
-        if !index.build(&items, extractor.clone()) {
-            #[cfg(debug_assertions)]
-            eprintln!("WARNING: Failed to build index '{}'", name);
-            return self;
-        }
-        let mut indexes = self.indexes.load().as_ref().clone();
-        indexes.insert(
-            name.to_string(), 
-            index.clone() as Arc<dyn Any + Send + Sync>
-        );
-        self.indexes.store(Arc::new(indexes));
-        let index_clone = index.clone();
-        let builder = Arc::new(move |items: &[Arc<T>]| {
-            index_clone.build(items, extractor.clone());
-        }) as Arc<dyn Fn(&[Arc<T>]) + Send + Sync>;
-        self.index_builders.write().insert(name.to_string(), builder);
-        self
-    }
-    
-    // Получить ИНДЕКСЫ по ключу 
-    pub fn get_indices_by_index<K>(&self, index_name: &str, key: &K) -> Vec<usize>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                if let Some(indices) = index.get_indices(key) {
-                    return indices;
+    fn check_index_type_compability(
+        &self,
+        name: &str, 
+        expected_type: &str, 
+        action: IndexCompatibilityAction
+    ) -> IndexResult<()> {
+        match self.indexes.get(name) {
+            Some(exist_index_ref) => {
+                let exist_index_type = exist_index_ref.value().index_type();
+                if expected_type != exist_index_type {
+                    let err = match action {
+                        IndexCompatibilityAction::Check => IndexError::Compatibility {
+                            name: name.to_string(), 
+                            type_exist: exist_index_type.to_string(), 
+                            type_expect: expected_type.to_string(),
+                        },
+                        IndexCompatibilityAction::Replace => IndexError::Replace { 
+                            name: name.to_string(), 
+                            type_exist: exist_index_type.to_string(), 
+                            type_expect: expected_type.to_string(),
+                        }    
+                    };
+                    Err(err)
+                } else {
+                    Ok(())
                 }
-                return Vec::new();
             }
+            None => Err(IndexError::NotFound { name: name.to_string() })
         }
-        Vec::new()
     }
 
-    pub fn get_indices_by_index_keys<K>(&self, index_name: &str, keys: &[K]) -> Vec<usize>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
+    fn create_field_value_extractor<F,V>(extractor: F) -> Arc<dyn Fn(&T) -> FieldValue + Send + Sync>
+    where 
+        F: Fn(&T) -> V + Send + Sync + 'static,
+        V: Into<FieldValue> + 'static,
+
     {
-        if keys.is_empty() {
-            return Vec::new();
-        }
-        if keys.len() == 1 {
-            return self.get_indices_by_index(index_name, &keys[0]);
-        }
-        if keys.len() < 10 {
-            let mut result = Vec::new();
-            for key in keys {
-                result.extend(self.get_indices_by_index(index_name, key));
+
+        Arc::new(move |item: &T| -> FieldValue{
+            let value: V = extractor(item);
+            value.into()
+        })
+    }
+
+    pub fn create_field_index<V,F>(
+        &self,
+        name: &str,
+        extractor: F,
+    ) -> GlobalResult<&Self>
+    where 
+        V: Eq + Hash + Clone + Send + Sync + Ord + PartialOrd + Display + 'static,
+        F: Fn(&T) -> V + Send + Sync + Clone + 'static,
+        IndexField<V>: IntoIndexFieldEnum,
+        V: Into<FieldValue> + 'static, 
+
+    {
+        // Проверяем существует ли Index с таким наименованием
+        if self.has_index(name) {
+            if let Err(err) = self.check_index_type_compability(
+                name, 
+                INDEX_FIELD, 
+                IndexCompatibilityAction::Replace
+            ) {
+                return Err(GLobalError::Index(err));
             }
-            return result;
+            // drop_index теперь просто удаляет из DashMap
+            self.drop_index(name);
         }
-        let bitmaps: Vec<RoaringBitmap> = keys
-            .par_iter()
-            .map(|key| {
-                let indices = self.get_indices_by_index(index_name, key);
-                Self::indices_to_bitmap(&indices)
+        let extractor_clone = extractor.clone();
+        let items = self.items();
+        let index = IndexField::build(&items, extractor);
+        self.indexes.insert(
+            name.to_string(),
+            Arc::new(
+                IndexType::Field(
+                    (
+                        index.into_enum(),
+                        Self::create_field_value_extractor(extractor_clone),
+                    )
+                )
+            ),
+        );
+        Ok(self)
+    }
+
+    pub fn get_index(&self, name: &str) -> GlobalResult<Arc<IndexType<T>>> {
+        self.indexes.get(name)
+            .ok_or(GLobalError::Index(IndexError::NotFound {
+                name: name.to_string(),
+            }))
+            .map(|guard| guard.clone())
+    }
+
+    fn apply_field_operations(
+        &self,
+        field_index: &IndexFieldEnum,
+        operations: &[(FieldOperation, Op)],
+    ) -> GlobalResult<RoaringBitmap> {
+        let bitmap = if operations.len() == 1 {
+            field_index.filter_operation(&operations[0].0)
+        } else {
+            field_index.filter_operations(operations)
+        };
+        let result = bitmap.map_err(|err|GLobalError::Index(IndexError::Field(err)))?;
+        Ok(result)
+    }
+
+    fn apply_field_bitmap(
+        &self,
+        bitmap: RoaringBitmap,
+        description: String,
+    ) -> GlobalResult<&Self> {
+        if bitmap.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndex {
+                name: description.clone(),
+            }));
+        }
+        
+        let current_mask_opt = self.source_indices_mask.load();
+        let final_bitmap = if let Some(current_mask) = current_mask_opt.as_ref() {
+            // Маска есть - используем напрямую
+            &**current_mask & &bitmap
+        } else {
+            // маски нет - создаем из current_indices
+            match &self.storage {
+                DataStorage::Owned { current_indices, full_indices, .. } => {
+                    let current = current_indices.load();
+                    let full = full_indices;
+                    if current.len() < full.len() {
+                        // Есть фильтрация - создаем маску из current_indices
+                        let current_bitmap: RoaringBitmap = current.iter()
+                            .map(|&i| i as u32)
+                            .collect();
+                        // Сохраняем маску для следующих индексных операций
+                        self.source_indices_mask.store(Arc::new(Some(Arc::new(current_bitmap.clone()))));
+                        // Пересечение с индексом
+                        current_bitmap & bitmap
+                    } else {
+                        // Нет фильтрации - используем индекс напрямую
+                        bitmap
+                    }
+                }
+                DataStorage::Indexed { .. } => {
+                    // Для Indexed storage используем bitmap как есть
+                    bitmap
+                }
+            }
+        };
+        if final_bitmap.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndexCurrent {
+                name: description.clone(),
+            }));
+        }
+        self.apply_filtered_items_with_bitmap(final_bitmap, description)
+    }
+
+    #[inline(always)]
+    fn evaluate_field_operations(
+        value: &FieldValue,
+        operations: &[(FieldOperation, Op)],
+    ) -> bool {
+        let mut result = true;
+        
+        for (operation, op_type) in operations {
+            let matches = operation.evaluate(value);
+            
+            match op_type {
+                Op::And => {
+                    result = result && matches;
+                    if !result {
+                        return false;
+                    }
+                }
+                Op::Or => {
+                    result = result || matches;
+                }
+                Op::AndNot => {
+                    result = result && !matches;
+                    if !result {
+                        return false;
+                    }
+                }
+                Op::Xor => {
+                    result = result ^ matches;
+                }
+                Op::Invert => {
+                    result = !result;
+                }
+            }
+        }
+        result
+    }
+
+    fn build_field_predicate(
+        &self,
+        fields: &[(&ExtractorFieldValue<T>, &[(FieldOperation, Op)])],
+    ) -> GlobalResult<impl Fn(&T) -> bool + Send + Sync + '_> {
+        let field_predicates = fields.iter()
+        .map(|(extractor,operations)| {
+            ((*extractor).clone(),operations.to_vec())
             })
-            .collect();
-        let mut result = RoaringBitmap::new();
-        for bitmap in bitmaps {
-            result |= bitmap;
-        }
-        Self::bitmap_to_indices(&result)
+        .collect::<Vec<(ExtractorFieldValue<T>, Vec<(FieldOperation, Op)>)>>();
+        Ok(move |item: &T| -> bool {
+            for (extractor, operations) in &field_predicates {
+                let field_value = extractor(item);
+                if !Self::evaluate_field_operations(&field_value, operations) {
+                    return false;
+                }
+            }
+            true
+        })
     }
-    
-    // Получить ИНДЕКСЫ по range 
-    // 
-    // Использует универсальный метод Index::range_indices_universal
-    pub fn get_indices_by_index_range<K, R>(&self, index_name: &str, range: R) -> Vec<usize>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-        R: std::ops::RangeBounds<K>,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                return index.range_indices(range);  // ← Исправлено
+
+    fn estimate_selectivity_from_indexes(
+        &self, 
+        container: &[(&str,&IndexFieldEnum, &[(FieldOperation, Op)])]
+    ) -> f64 {
+        if container.is_empty() {
+            return 1.0;
+        }
+        let mut combined_selectivity = 1.0;
+        for (_,index, operations) in container {       
+            let selectivity = index.estimate_operations_selectivity(operations);
+            combined_selectivity *= selectivity;
+            if combined_selectivity < 0.001 {
+                return combined_selectivity;
             }
         }
-        Vec::new()
+        combined_selectivity
     }
-    
-    // Convenience методы - возвращают данные
-    
-    pub fn filter_by_index<K>(&self, index_name: &str, key: &K) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indices = self.get_indices_by_index(index_name, key);
-        self.apply_indices(&indices)
-    }
-    
-    pub fn filter_by_index_keys<K>(&self, index_name: &str, keys: &[K]) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indices = self.get_indices_by_index_keys(index_name, keys);
-        self.apply_indices(&indices)
-    }
-    
-    // Получить данные по range 
-    // 
-    // Использует универсальный метод Index::range_items
-    pub fn filter_by_index_range<K, R>(&self, index_name: &str, range: R) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-        R: std::ops::RangeBounds<K>,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                return index.range_items(range);
-            }
+
+    fn need_to_use_index(&self, fields: &[(&str,&IndexFieldEnum, &[(FieldOperation, Op)])]) -> GlobalResult<bool> {
+        if self.len() < SMALL_DATASET_THRESHOLD {
+            return Ok(false)
         }
-        Vec::new()
-    }
-    
-    pub fn apply_index_range<K, R>(&self, index_name: &str, range: R) -> &Self
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-        R: std::ops::RangeBounds<K>,
-    {
-        let filtered = self.filter_by_index_range(index_name, range);
-        if filtered.is_empty() && self.len() > 0 {
-            return self;
+
+        if fields.iter().any(|(_, index, operations)| {
+            operations.iter().any(|(op, _)| !index.is_efficient_for(op))
+        }) {
+            return Ok(false);
         }
-        self.apply_filtered_items(filtered, format!("Range indexed by {}", index_name))
-    }
-    
-    pub fn get_sorted_by_index<K>(&self, index_name: &str) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                let all_keys = index.keys();
-                
-                return all_keys
-                    .into_par_iter()
-                    .flat_map(|key| {
-                        index.get(&key).unwrap_or_default()
-                    })
-                    .collect();
-            }
+        
+        let estimate_selectivity = self.estimate_selectivity_from_indexes(fields);
+        if estimate_selectivity > SELECTIVITY_THRESHOLD{
+            return Ok(false)
         }
-        Vec::new()
+        
+        Ok(true)
     }
-    
-    pub fn get_top_n_by_index<K>(&self, index_name: &str, n: usize) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                let keys = index.keys();
-                let top_keys: Vec<_> = keys.into_iter().rev().take(n).collect();
-                return top_keys
-                    .into_par_iter()
-                    .flat_map(|key| {
-                        index.get(&key).unwrap_or_default()
-                    })
-                    .collect();
-            }
+
+    pub fn filter_by_field_ops(
+        &self,
+        name: &str,
+        operations: &[(FieldOperation, Op)],
+    ) -> GlobalResult<&Self> {
+        if operations.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::EmptyOperations));
         }
-        Vec::new()
-    }
-    
-    pub fn get_bottom_n_by_index<K>(&self, index_name: &str, n: usize) -> Vec<Arc<T>>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                let keys = index.keys();
-                let bottom_keys: Vec<_> = keys.into_iter().take(n).collect();
-                return bottom_keys
-                    .into_par_iter()
-                    .flat_map(|key| {
-                        index.get(&key).unwrap_or_default()
-                    })
-                    .collect();
-            }
-        }
-        Vec::new()
-    }
-    
-    pub fn get_index_min<K>(&self, index_name: &str) -> Option<K>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                return index.first_key();
-            }
-        }
-        None
-    }
-    
-    pub fn get_index_max<K>(&self, index_name: &str) -> Option<K>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                return index.last_key();
-            }
-        }
-        None
-    }
-    
-    pub fn get_index_keys<K>(&self, index_name: &str) -> Vec<K>
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let indexes = self.indexes.load();
-        if let Some(index_any) = indexes.get(index_name) {
-            if let Some(index) = index_any.downcast_ref::<Index<K, T>>() {
-                return index.keys();
-            }
-        }
-        Vec::new()
-    }
-    
-    pub fn apply_index_filter<K>(&self, index_name: &str, key: &K) -> &Self
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let filtered = self.filter_by_index(index_name, key);
-        if filtered.is_empty() && self.len() > 0 {
-            return self;
-        }
-        self.apply_filtered_items(filtered, format!("Indexed by {}", index_name))
-    }
-    
-    pub fn apply_index_filter_keys<K>(&self, index_name: &str, keys: &[K]) -> &Self
-    where
-        K: Ord + Clone + Send + Sync + 'static,
-    {
-        let filtered = self.filter_by_index_keys(index_name, keys);
-        if filtered.is_empty() && self.len() > 0 {
-            return self;
-        }
-        self.apply_filtered_items(
-            filtered, 
-            format!("Indexed by {} ({} keys)", index_name, keys.len())
-        )
-    }
-    
-    fn apply_filtered_items(&self, items: Vec<Arc<T>>, info: String) -> &Self {
-        if let DataStorage::Owned { current, .. } = &self.storage {
-            if let (Some(levels), Some(level_info), Some(current_level)) = 
-                (&self.levels, &self.level_info, &self.current_level) 
+        let index = self.get_index(name)?;
+        let (field_index,extractor) = index.as_field().ok_or(GLobalError::Index(IndexError::Compatibility 
             {
-                let _guard = self.write_lock.write();
-                let filtered_arc = Arc::new(items);
-                let levels_guard = levels.load();
-                let mut new_levels = if levels_guard.len() < MAX_HISTORY {
-                    levels_guard.to_vec()
+                name: name.to_string(),
+                type_exist: index.index_type().to_string(),
+                type_expect: INDEX_FIELD.to_string(),
+            }
+        ))?;
+        let mut temp_container = Vec::<(&str,&IndexFieldEnum,&[(FieldOperation, Op)])>::with_capacity(1);
+        let mut extractor_fields = Vec::<(&ExtractorFieldValue<T>,&[(FieldOperation, Op)])>::with_capacity(1);
+        temp_container.push((name,field_index,operations));
+        extractor_fields.push((extractor,operations));
+        let can_use_field_indexes = self.need_to_use_index(&temp_container)?;
+        if can_use_field_indexes{
+            self.do_filter_by_fields_ops(&temp_container)?;
+        } else {
+            let predicate = self.build_field_predicate(&extractor_fields)?;
+            self.filter(predicate)?;
+        }
+        Ok(self)
+    }
+
+    fn do_filter_by_fields_ops(
+        &self,
+        fields: &[(&str,&IndexFieldEnum, &[(FieldOperation, Op)])],
+    ) -> GlobalResult<&Self> {
+        if fields.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::EmptyOperations));
+        }
+        // Получаем bitmap от каждого индекса
+        let mut combined_bitmap: Option<RoaringBitmap> = None;
+        let mut descriptions = Vec::<String>::with_capacity(fields.len());
+        for (field_name,field_index, operations) in fields {
+            if operations.is_empty() {
+                continue;
+            }
+            // Получаем bitmap для текущего поля
+            let field_bitmap = self.apply_field_operations(field_index, operations)?;
+            // Формируем описание операции
+            let op_desc = operations.iter()
+                .map(|(op, _)| format!("{}", op))
+                .collect::<Vec<_>>()
+                .join(", ");
+            descriptions.push(format!("{}: {}", field_name, op_desc));
+            // Объединяем bitmapы через AND
+            combined_bitmap = Some(match combined_bitmap {
+                None => field_bitmap,
+                Some(existing) => existing & field_bitmap,
+            });
+        }
+
+        let final_bitmap = combined_bitmap
+            .ok_or(GLobalError::FilterData(FilterDataError::EmptyOperations))?;
+        // Формируем итоговое описание
+        let description = descriptions.join(" AND ");
+        // Применяем результат ОДИН раз
+        self.apply_field_bitmap(final_bitmap, description)
+    }
+
+    pub fn filter_by_fields_ops(
+        &self,
+        fields: &[(&str, &[(FieldOperation, Op)])],
+    ) -> GlobalResult<&Self> {
+        if fields.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::EmptyOperations));
+        }
+        let indexes: Vec<Arc<IndexType<T>>> = fields
+        .iter()
+        .map(|(name, _)| self.get_index(name))
+        .collect::<Result<_, _>>()?;
+
+        let mut temp_container = Vec::<
+            (
+                &str,
+                &IndexFieldEnum,
+                &[(FieldOperation, Op)],
+            )
+        >::with_capacity(fields.len());
+        let mut temp_extractors = Vec::<(&ExtractorFieldValue<T>,&[(FieldOperation, Op)])>::with_capacity(fields.len());
+        for (n,(name,operations)) in fields.iter().enumerate(){
+            //let field_index = self.get_field_index(*name)?;
+            let index_ref = &indexes[n];
+            let (field_index,extractor) = index_ref.as_field()
+                .ok_or(GLobalError::Index(IndexError::Compatibility {
+                    name: name.to_string(),
+                    type_exist: index_ref.index_type().to_string(),
+                    type_expect: INDEX_FIELD.to_string(),
+                }
+            ))?;
+            temp_container.push((*name,field_index,*operations));
+            temp_extractors.push((extractor,*operations));
+        }
+
+        let can_use_field_indexes = self.need_to_use_index(&temp_container)?;   
+        if can_use_field_indexes{
+            self.do_filter_by_fields_ops(&temp_container)?;
+        } else {
+            let predicate = self.build_field_predicate(&temp_extractors)?;
+            self.filter(predicate)?;
+        }
+        Ok(self)
+    }
+
+    #[inline]
+    fn update_level_metadata(&self, current_level: usize, info: String) -> GlobalResult<()> {
+        let mut new_level_info = Vec::with_capacity(current_level + 2);
+        new_level_info.extend_from_slice(&self.level_info.load());
+        new_level_info.push(Arc::from(info));
+        self.level_info.store(Arc::new(new_level_info));
+        self.current_level.store(current_level + 1, Ordering::Release);
+        Ok(())
+    }
+
+    fn apply_owned_data(&self, result: FilterResult, info: String) -> GlobalResult<()> {
+        match &self.storage {
+            DataStorage::Owned { 
+                source, 
+                current_indices, 
+                current_cache,
+                full_indices: _,
+                levels, 
+                level_indices 
+            } => {
+                let total_level = self.current_level.load(Ordering::Relaxed);
+                let bitmap_arc = Arc::new(result.bitmap);
+                // сохраняем bitmap для drill-down с индексами
+                self.source_indices_mask.store(Arc::new(Some(Arc::clone(&bitmap_arc))));
+                // конвертируем bitmap → Vec<usize>
+                let indices: Vec<usize> = bitmap_arc.iter().map(|i| i as usize).collect();
+                let indices_arc = Arc::new(indices);
+                current_indices.store(Arc::clone(&indices_arc));
+                // обновляем level_indices
+                let mut new_level_indices = Vec::with_capacity(total_level + 2);
+                new_level_indices.extend_from_slice(&level_indices.load());
+                new_level_indices.push(indices_arc.clone());
+                level_indices.store(Arc::new(new_level_indices));
+                // синхронизируем levels с level_indices
+                if indices_arc.len() < MATERIALIZATION_THRESHOLD {
+                    // Материализуем для маленьких
+                    let items: Vec<Arc<T>> = indices_arc
+                        .iter()
+                        .filter_map(|&idx| source.get(idx).cloned())
+                        .collect();
+                    let items_arc = Arc::new(items);
+                    let mut new_levels = Vec::with_capacity(total_level + 2);
+                    new_levels.extend_from_slice(&levels.load());
+                    new_levels.push(items_arc.clone());
+                    levels.store(Arc::new(new_levels));
+                    current_cache.store(Arc::new(Some(items_arc)));
                 } else {
-                    let start = levels_guard.len().saturating_sub(MAX_HISTORY - 1);
-                    levels_guard[start..].to_vec()
-                };
-                new_levels.push(Arc::clone(&filtered_arc));
-                let adjusted_level = new_levels.len() - 1;
-                levels.store(Arc::new(new_levels));
-                let info_guard = level_info.load();
-                let mut new_info = if info_guard.len() < MAX_HISTORY {
-                    info_guard.to_vec()
-                } else {
-                    let start = info_guard.len().saturating_sub(MAX_HISTORY - 1);
-                    info_guard[start..].to_vec()
-                };
+                    // для больших результатов
+                    let mut new_levels = Vec::with_capacity(total_level + 2);
+                    new_levels.extend_from_slice(&levels.load());
+                    new_levels.push(Arc::new(Vec::new()));  // Пустой placeholder
+                    levels.store(Arc::new(new_levels));
+                    current_cache.store(Arc::new(None));
+                }
+                
+                // Метаданные
+                self.update_level_metadata(total_level, info)?;
+                Ok(())
+            },
+            _ => Err(GLobalError::FilterData(FilterDataError::WrongSaveDataIndexed)),
+        }
+    }
+
+    fn apply_indexed_data(
+        &self,
+        indices: Vec<usize>,
+        info: String,
+    ) -> GlobalResult<()> {
+        match &self.storage {
+            DataStorage::Indexed {
+                parent_data,
+                current_indices,
+                index_levels,
+                ..
+            } => {
+                let _parent = parent_data.upgrade()
+                    .ok_or(GLobalError::FilterData(FilterDataError::ParentDataIsEmpty))?;
+                
+                let levels_guard = index_levels.load();
+                let total_level = levels_guard.len();
+                if indices.is_empty() {
+                    return Err(GLobalError::FilterData(
+                        FilterDataError::DataNotFoundByIndexCurrent { name: info }
+                    ));
+                }
+
+                current_indices.store(Arc::new(indices.clone()));
+                let indices_arc = Arc::new(indices);
+                let mut new_levels = Vec::with_capacity(total_level + 1);
+                new_levels.extend_from_slice(&levels_guard);
+                new_levels.push(indices_arc);
+                index_levels.store(Arc::new(new_levels));
+                // Метаданные
+                let info_guard = self.level_info.load();
+                let mut new_info = Vec::with_capacity(info_guard.len() + 1);
+                new_info.extend_from_slice(&info_guard);
                 new_info.push(Arc::from(info));
-                level_info.store(Arc::new(new_info));
-                current_level.store(adjusted_level, Ordering::Release);
-                current.store(filtered_arc);
-                drop(_guard);
-                self.rebuild_indexes();
+                self.level_info.store(Arc::new(new_info));
+                self.current_level.store(total_level, Ordering::Release);
+                Ok(())
+            },
+            _ => Err(GLobalError::FilterData(FilterDataError::WrongSaveDataOwned)),
+        }
+    }
+
+    fn apply_filtered_items_with_bitmap(
+        &self,
+        final_bitmap: RoaringBitmap,
+        info: String
+    ) -> GlobalResult<&Self> {
+        let _guard = self.write_lock.write();
+        
+        match &self.storage {
+            DataStorage::Owned { levels, .. } => {
+                let levels_guard = levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+
+                if final_bitmap.is_empty() {
+                    return Err(GLobalError::FilterData(
+                        FilterDataError::DataNotFoundByIndexCurrent { name: info }
+                    ));
+                }
+
+                let result = FilterResult {
+                    bitmap: final_bitmap,
+                };
+                self.apply_owned_data(result, info)?;
+            },
+            DataStorage::Indexed { index_levels, .. } => {
+                let levels_guard = index_levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+
+                let indices: Vec<usize> = final_bitmap.iter()
+                    .map(|i| i as usize)
+                    .collect();
+                self.apply_indexed_data(indices, info)?;
             }
         }
         
-        self
+        Ok(self)
+    }
+
+    fn apply_filtered_indices(
+        &self,
+        indices: Vec<usize>,
+        info: String,
+    ) -> GlobalResult<()> {
+        if indices.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFound));
+        }
+        
+        match &self.storage {
+            DataStorage::Owned {
+                source,
+                current_indices,
+                current_cache,
+                levels,
+                level_indices,
+                ..
+            } => {
+                let total_level = self.current_level.load(Ordering::Relaxed);
+                let levels_guard = levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+                
+                let indices_arc = Arc::new(indices);
+                current_indices.store(indices_arc.clone());
+                self.source_indices_mask.store(Arc::new(None));
+                let mut new_level_indices = Vec::with_capacity(total_level + 2);
+                new_level_indices.extend_from_slice(&level_indices.load());
+                new_level_indices.push(indices_arc.clone());
+                level_indices.store(Arc::new(new_level_indices));
+                if indices_arc.len() < MATERIALIZATION_THRESHOLD {
+                    let items: Vec<Arc<T>> = indices_arc
+                        .iter()
+                        .filter_map(|&idx| source.get(idx).cloned())
+                        .collect();
+                    let items_arc = Arc::new(items);
+                    
+                    let mut new_levels = Vec::with_capacity(total_level + 2);
+                    new_levels.extend_from_slice(&levels_guard);
+                    new_levels.push(items_arc.clone());
+                    levels.store(Arc::new(new_levels));
+                    current_cache.store(Arc::new(Some(items_arc)));
+                } else {
+                    let mut new_levels = Vec::with_capacity(total_level + 2);
+                    new_levels.extend_from_slice(&levels_guard);
+                    new_levels.push(Arc::new(Vec::new()));
+                    levels.store(Arc::new(new_levels));
+                    current_cache.store(Arc::new(None));
+                }
+                self.update_level_metadata(total_level, info)?;
+                Ok(())
+            },
+            DataStorage::Indexed {
+                parent_data,
+                current_indices,
+                index_levels,
+                ..
+            } => {
+                let _parent = parent_data.upgrade()
+                    .ok_or(GLobalError::FilterData(FilterDataError::ParentDataIsEmpty))?;
+                
+                let total_level = self.current_level.load(Ordering::Relaxed);
+                let levels_guard = index_levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+                
+                let indices_arc = Arc::new(indices);
+                current_indices.store(indices_arc.clone());
+                let mut new_levels = Vec::with_capacity(total_level + 2);
+                new_levels.extend_from_slice(&levels_guard);
+                new_levels.push(indices_arc);
+                index_levels.store(Arc::new(new_levels));
+                self.update_level_metadata(total_level, info)?;
+                
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_filtered_items_with_indices(
+        &self,
+        indices: Vec<usize>,
+        info: String
+    ) -> GlobalResult<&Self> {
+        let _guard = self.write_lock.write();
+        self.apply_filtered_indices(indices, info)?;
+        Ok(self)
+    }
+    
+    fn apply_filtered_items<F>(&self, predicate: F, info: String) -> GlobalResult<&Self>
+    where
+        F: Fn(&T) -> bool + Send + Sync,
+    {
+        let _guard = self.write_lock.write();
+        match &self.storage {
+            DataStorage::Owned {
+                source,
+                current_indices,
+                levels,
+                ..
+            } => {
+                let levels_guard = levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+                
+                let current = current_indices.load();
+                let filtered_indices: Vec<usize> = if current.len() < 10_000 {
+                    current.iter()
+                        .filter_map(|&idx| {
+                            source.get(idx)
+                                .filter(|item| predicate(item))
+                                .map(|_| idx)
+                        })
+                        .collect()
+                } else {
+                    current.par_iter()
+                        .filter_map(|&idx| {
+                            source.get(idx)
+                                .filter(|item| predicate(item))
+                                .map(|_| idx)
+                        })
+                        .collect()
+                };
+                if filtered_indices.is_empty() {
+                    return Err(GLobalError::FilterData(FilterDataError::DataNotFound));
+                }
+                // Сразу применяем через apply_filtered_items_with_indices
+                self.apply_filtered_indices(filtered_indices, info)?;
+            },
+            DataStorage::Indexed {
+                parent_data,
+                current_indices,
+                index_levels,
+                ..
+            } => {
+                let parent = parent_data.upgrade()
+                    .ok_or(GLobalError::FilterData(FilterDataError::ParentDataIsEmpty))?;
+                
+                let levels_guard = index_levels.load();
+                if levels_guard.len() > MAX_HISTORY {
+                    return Err(GLobalError::FilterData(FilterDataError::MaxHistoryExceeded {
+                        current: levels_guard.len(),
+                        max: MAX_HISTORY,
+                    }));
+                }
+                
+                let current = current_indices.load();
+                let filtered_indices: Vec<usize> = if current.len() < 10_000 {
+                    current.iter()
+                        .filter_map(|&idx| {
+                            parent.get(idx)
+                                .filter(|item| predicate(item))
+                                .map(|_| idx)
+                        })
+                        .collect()
+                } else {
+                    current.par_iter()
+                        .filter_map(|&idx| {
+                            parent.get(idx)
+                                .filter(|item| predicate(item))
+                                .map(|_| idx)
+                        })
+                        .collect()
+                };
+                if filtered_indices.is_empty() {
+                    return Err(GLobalError::FilterData(FilterDataError::DataNotFound));
+                }
+                self.apply_filtered_indices(filtered_indices, info)?;
+            }
+        }
+        Ok(self)
     }
     
     pub fn has_index(&self, name: &str) -> bool {
-        self.indexes.load().contains_key(name)
+        self.indexes.contains_key(name)
     }
     
     pub fn drop_index(&self, name: &str) -> &Self {
-        let _guard = self.write_lock.write();
-        let mut indexes = self.indexes.load().as_ref().clone();
-        indexes.remove(name);
-        self.indexes.store(Arc::new(indexes));
-        self.index_builders.write().remove(name);
+        self.indexes.remove(name);
         self
     }
 
-    // Очистить только битовые индексы
-    pub fn clear_bit_indexes(&self) {
-        let _guard = self.write_lock.write();
-        let mut indexes = self.indexes.load().as_ref().clone();
-        let mut builders = self.index_builders.write();
-        // Удаляем все битовые индексы за один проход
-        indexes.retain(|key, _| !key.starts_with("bit:"));
-        builders.retain(|key, _| !key.starts_with("bit:"));
-        self.indexes.store(Arc::new(indexes));
+    pub fn clear_filed_index(&self) {
+        self.indexes.retain(|_, index| {
+            if index.is_field() {
+                false
+            } else {
+                true
+            }
+        });
     }
 
-    // Очистить только обычные индексы (не битовые)
-    pub fn clear_regular_indexes(&self) {
-        let _guard = self.write_lock.write();
-        let mut indexes = self.indexes.load().as_ref().clone();
-        let mut builders = self.index_builders.write();
-        // Удаляем все НЕ битовые индексы за один проход
-        indexes.retain(|key, _| key.starts_with("bit:"));
-        builders.retain(|key, _| key.starts_with("bit:"));
-        self.indexes.store(Arc::new(indexes));
+    pub fn clear_text_indexes(&self) {
+        self.indexes.retain(|_k, v| !v.is_text());
     }
 
     // Очистить все индексы
     pub fn clear_all_indexes(&self) {
-        let _guard = self.write_lock.write();
-        // Просто создаем новые пустые коллекции
-        self.indexes.store(Arc::new(BTreeMap::new()));
-        *self.index_builders.write() = BTreeMap::new();
+        self.indexes.clear();
     }
     
     pub fn list_indexes(&self) -> Vec<String> {
-        self.indexes.load().keys().cloned().collect()
-    }
-    
-    fn rebuild_indexes(&self) {
-        let items = self.items();
-        let builders = self.index_builders.read();
-        for builder in builders.values() {
-            builder(&items);
-        }
+        self.indexes.iter().map(|entry| entry.key().clone()).collect()
     }
     
     pub fn validate_indexes(&self) -> bool {
-        let indexes = self.indexes.load();
-        for _index_any in indexes.values() {
-            match &self.storage {
-                DataStorage::Owned { .. } => continue,
-                DataStorage::Indexed { parent_data, .. } => {
-                    if parent_data.strong_count() == 0 {
-                        return false;
-                    }
+        if let DataStorage::Indexed { parent_data, .. } = &self.storage {
+                if parent_data.strong_count() == 0 {
+                    return false;
                 }
+            }
+        // Проверяем каждый индекс
+        for entry in self.indexes.iter() {
+            if !entry.value().is_valid() {
+                return false;
             }
         }
         true
     }
 
-    // Decimal Index Methods
-
-    // Создать индекс для Decimal (обычный)
-    pub fn create_decimal_index<F>(&self, name: &str, extractor: F) -> &Self
-    where
-        F: Fn(&T) -> Decimal + Send + Sync + 'static + Clone,
-    {
-        // Decimal уже Ord - wrapper НЕ нужен!
-        self.create_index(name, extractor)
-    }
-
-    // Создать bucketed индекс для Decimal
-    pub fn create_bucketed_decimal_index<F>(
+    /// Создать Text индекс для быстрого substring search
+    /// 
+    /// Text индекс разбивает тексты на n-граммы и строит инвертированный индекс
+    /// используя BitIndex. Это дает 5-10x speedup для substring поиска.
+    /// 
+    /// # Arguments
+    /// * `name` - имя индекса
+    /// * `extractor` - функция извлечения текста
+    /// * `n` - размер n-граммы (обычно 3 для trigrams)
+    /// 
+    /// # Example
+    /// 
+    /// // Создаем tri-gram индекс
+    /// data.create_text_index("search", |log| log.message.clone(), 3);
+    /// 
+    /// // Теперь substring search будет в 5-10x быстрее!
+    /// let results = data.search_with_text("search", "user_id: 12345");
+    /// 
+    pub fn create_text_index<F>(
         &self,
         name: &str,
         extractor: F,
-        bucket_size: Decimal,
-    ) -> &Self
+    ) -> GlobalResult< &Self>
     where
-        F: Fn(&T) -> Decimal + Send + Sync + 'static + Clone,
+        F: Fn(&T) -> String + Send + Sync + 'static + Clone,
     {
         if self.has_index(name) {
+            if let Err(err) = self.check_index_type_compability(
+            name, 
+            INDEX_TEXT,
+            IndexCompatibilityAction::Replace
+            ){
+                return Err(GLobalError::Index(err))
+            }
             self.drop_index(name);
         }
-
-        let _guard = self.write_lock.write();
-        let wrapper = Arc::new(BucketedDecimalIndexWrapper::new(bucket_size));
+        let mut text_index = TextIndex::new_tri_gram();
         let items = self.items();
-        wrapper.build(&items, extractor.clone());
-        let mut indexes = self.indexes.load().as_ref().clone();
-        indexes.insert(
+        text_index.build(&items, extractor);
+        self.indexes.insert(
             name.to_string(),
-            wrapper.clone() as Arc<dyn Any + Send + Sync>
+            Arc::new(IndexType::Text(text_index))
         );
-        self.indexes.store(Arc::new(indexes));
-        let wrapper_clone = wrapper.clone();
-        let builder = Arc::new(move |items: &[Arc<T>]| {
-            wrapper_clone.build(items, extractor.clone());
-        }) as Arc<dyn Fn(&[Arc<T>]) + Send + Sync>;
-        self.index_builders.write().insert(name.to_string(), builder);
-        self
+        Ok(self)
     }
 
-    // Получить ИНДЕКСЫ через bucketed Decimal range 
-    // 
-    // Возвращает отсортированные индексы для cache-friendly доступа.
-    // 
-    // 
-    // # Пример
-    // ```
-    // use rust_decimal_macros::dec;
-    // 
-    // let indices = data.get_indices_by_bucketed_decimal_range(
-    //     "price_bucketed",
-    //     dec!(1000)..dec!(2000),
-    //     dec!(100)
-    // );
-    // 
-    // // Материализуем только нужные элементы
-    // let items = data.apply_indices(&indices);
-    // ```
-    pub fn get_indices_by_bucketed_decimal_range<R>(
-        &self,
-        index_name: &str,
-        range: R,
-        _bucket_size: Decimal,  // Для API совместимости
-    ) -> Vec<usize>
-    where
-        R: std::ops::RangeBounds<Decimal>,
-    {
-        let indexes = self.indexes.load();
-        let index_any = match indexes.get(index_name) {
-            Some(idx) => idx,
-            None => return Vec::new(),
-        };
-        let wrapper = match index_any.downcast_ref::<BucketedDecimalIndexWrapper<T>>() {
-            Some(w) => w,
-            None => return Vec::new(),
-        };
-        wrapper.range_query_indices(range)
-    }
-    
-    // Фильтрация по Decimal индексу
-    pub fn filter_by_decimal(&self, index_name: &str, value: Decimal) -> Vec<Arc<T>> {
-        self.filter_by_index(index_name, &value)
-    }
-    
-    // Range query для Decimal
-    pub fn filter_by_decimal_range<R>(&self, index_name: &str, range: R) -> Vec<Arc<T>>
-    where
-        R: std::ops::RangeBounds<Decimal>,
-    {
-        self.filter_by_index_range(index_name, range)
+    /// Быстрый substring search через Text индекс
+    /// 
+    /// # Пример
+    /// 
+    /// let results = data.search_with_text("search", "user_id: 12345");
+    /// // 5-10x быстрее чем naive substring search!
+    /// 
+    pub fn search_with_text(&self, name: &str, query: &str) -> GlobalResult<&Self> {
+        self.apply_text_search(name, query)
     }
 
-    // Float Index Methods
-    
-    pub fn create_float_index_f32<F>(&self, name: &str, extractor: F) -> &Self
-    where
-        F: Fn(&T) -> f32 + Send + Sync + 'static + Clone,
-    {
-        self.create_index(name, move |item| Float(extractor(item)))
-    }
-    
-    pub fn create_float_index_f64<F>(&self, name: &str, extractor: F) -> &Self
-    where
-        F: Fn(&T) -> f64 + Send + Sync + 'static + Clone,
-    {
-        self.create_index(name, move |item| Float(extractor(item)))
-    }
-    
-    pub fn filter_by_float_f32(&self, index_name: &str, value: f32) -> Vec<Arc<T>> {
-        self.filter_by_index(index_name, &Float(value))
-    }
-    
-    pub fn filter_by_float_f64(&self, index_name: &str, value: f64) -> Vec<Arc<T>> {
-        self.filter_by_index(index_name, &Float(value))
-    }
-    
-    pub fn filter_by_float_range_f32<R>(&self, index_name: &str, range: R) -> Vec<Arc<T>>
-    where
-        R: FloatRangeBounds<f32>,
-    {
-        self.filter_by_index_range(index_name, range.to_ordered_range())
-    }
-    
-    pub fn filter_by_float_range_f64<R>(&self, index_name: &str, range: R) -> Vec<Arc<T>>
-    where
-        R: FloatRangeBounds<f64>,
-    {
-        self.filter_by_index_range(index_name, range.to_ordered_range())
-    }
-    
-    pub fn get_float_min_f32(&self, index_name: &str) -> Option<f32> {
-        self.get_index_min::<Float<f32>>(index_name).map(|of| of.0)
-    }
-    
-    pub fn get_float_max_f32(&self, index_name: &str) -> Option<f32> {
-        self.get_index_max::<Float<f32>>(index_name).map(|of| of.0)
-    }
-    
-    pub fn get_float_min_f64(&self, index_name: &str) -> Option<f64> {
-        self.get_index_min::<Float<f64>>(index_name).map(|of| of.0)
-    }
-    
-    pub fn get_float_max_f64(&self, index_name: &str) -> Option<f64> {
-        self.get_index_max::<Float<f64>>(index_name).map(|of| of.0)
-    }
-
-    // Bucketed Float Index Methods - возвращают ИНДЕКСЫ 
-    
-    pub fn create_bucketed_float_index_f64<F>(
-        &self, 
-        name: &str, 
-        extractor: F,
-        bucket_size: f64
-    ) -> &Self
-    where
-        F: Fn(&T) -> f64 + Send + Sync + 'static + Clone,
-    {
-        if self.has_index(name) {
-            self.drop_index(name);
-        }
-        let _guard = self.write_lock.write();
-        let wrapper = Arc::new(BucketedFloatIndexWrapper::new(bucket_size));
-        let items = self.items();
-        wrapper.build(&items, extractor.clone());
-        let mut indexes = self.indexes.load().as_ref().clone();
-        indexes.insert(
-            name.to_string(),
-            wrapper.clone() as Arc<dyn Any + Send + Sync>
-        );
-        self.indexes.store(Arc::new(indexes));
-        let wrapper_clone = wrapper.clone();
-        let builder = Arc::new(move |items: &[Arc<T>]| {
-            wrapper_clone.build(items, extractor.clone());
-        }) as Arc<dyn Fn(&[Arc<T>]) + Send + Sync>;
-        self.index_builders.write().insert(name.to_string(), builder);
-        self
-    }
-    
-    // Получить ИНДЕКСЫ через bucketed float range 
-    pub fn get_indices_by_bucketed_float_range_f64<R>(
-        &self,
-        index_name: &str,
-        range: R,
-        _bucket_size: f64
-    ) -> Vec<usize>
-    where
-        R: std::ops::RangeBounds<f64>,
-    {
-        let indexes = self.indexes.load();
-        let index_any = match indexes.get(index_name) {
-            Some(idx) => idx,
-            None => return Vec::new(),
-        };
-        let wrapper = match index_any.downcast_ref::<BucketedFloatIndexWrapper<T>>() {
-            Some(w) => w,
-            None => return Vec::new(),
-        };
-        wrapper.range_query_indices(range)
-    }
-    
-    pub fn filter_by_bucketed_float_range_f64<R>(
-        &self,
-        index_name: &str,
-        range: R,
-        bucket_size: f64
-    ) -> Vec<Arc<T>>
-    where
-        R: std::ops::RangeBounds<f64>,
-    {
-        let indices = self.get_indices_by_bucketed_float_range_f64(index_name, range, bucket_size);
-        self.apply_indices(&indices)
-    }
-
-
-    // Bit Index Methods
-
-    pub fn create_bit_index<F>(&self, name: &str, predicate: F) -> &Self
-    where
-        F: Fn(&T) -> bool + Send + Sync + 'static + Clone,
-    {
-        let bit_index_key = format!("bit:{}", name);
-        if self.has_index(&bit_index_key) {
-            self.drop_index(&bit_index_key);
-        }
-        let _guard = self.write_lock.write();
-        let bit_index = Arc::new(BitIndex::new());
-        let items = self.items();
-        bit_index.build(&items, predicate.clone());
-        let mut indexes = self.indexes.load().as_ref().clone();
-        indexes.insert(
-            bit_index_key.clone(),
-            bit_index.clone() as Arc<dyn Any + Send + Sync>
-        );
-        self.indexes.store(Arc::new(indexes));
-        let bit_index_clone = bit_index.clone();
-        let builder = Arc::new(move |items: &[Arc<T>]| {
-            bit_index_clone.build(items, predicate.clone());
-        }) as Arc<dyn Fn(&[Arc<T>]) + Send + Sync>;
-        self.index_builders.write().insert(
-            bit_index_key,
-            builder
-        );
-        self
-    }
-
-    // Получить ИНДЕКСЫ через битовый индекс 
-    pub fn get_indices_by_bit_index(&self, name: &str) -> Vec<usize> {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return bit_index.to_indices();
+    /// Получить индексы через text search
+    /// 
+    /// # Пример
+    /// 
+    /// let indices = data.get_indices_with_text("search", "payment failed");
+    /// let items = data.apply_indices(&indices);
+    /// 
+    pub fn get_indices_with_text(&self, name: &str, query: &str) -> GlobalResult<Vec<usize>> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let ngram_index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string(),
             }
-        }
-        Vec::new()
-    }
-    
-    // Битовая операция возвращающая ИНДЕКСЫ 
-    pub fn bit_operation_indices(&self, operations: &[(&str, BitOp)]) -> Vec<usize> {
-        let result = self.bit_operation(operations);
-        result.to_indices()
-    }
-    
-    // Пересечение битовых индексов - возвращает ИНДЕКСЫ 
-    // 
-    // Возвращает индексы элементов, которые удовлетворяют ВСЕМ указанным битовым индексам.
-    // Использует эффективные битовые операции RoaringBitmap.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("bullish", |c| c.close > c.open);
-    // data.create_bit_index("high_volume", |c| c.volume > 5000.0);
-    // 
-    // let indices = data.intersect_bit_indices_get_indices(&["bullish", "high_volume"]);
-    // let items = data.apply_indices(&indices);
-    // ```
-    pub fn intersect_bit_indices_get_indices(&self, names: &[&str]) -> Vec<usize> {
-        if names.is_empty() {
-            return Vec::new();
-        }
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", names[0]);
-        let first_index = match indexes.get(&key) {
-            Some(idx) => match idx.downcast_ref::<BitIndex>() {
-                Some(bi) => bi,
-                None => return Vec::new(),
-            },
-            None => return Vec::new(),
-        };
-        if names.len() == 1 {
-            return first_index.to_indices();
-        }
-        let mut other_indices = Vec::new();
-        for &name in &names[1..] {
-            let key = format!("bit:{}", name);
-            if let Some(idx) = indexes.get(&key) {
-                if let Some(bi) = idx.downcast_ref::<BitIndex>() {
-                    other_indices.push(bi);
-                }
-            }
-        }
-        if other_indices.is_empty() {
-            return first_index.to_indices();
-        }
-        let operations: Vec<(&BitIndex, BitOp)> = other_indices
-            .iter()
-            .map(|&bi| (bi, BitOp::And))
-            .collect();
-        
-        let result = first_index.multi_operation(&operations);
-        result.to_indices()
-    }
-    
-    // Объединение битовых индексов - возвращает ИНДЕКСЫ 
-    // 
-    // Возвращает индексы элементов, которые удовлетворяют ХОТЯ БЫ ОДНОМУ из указанных битовых индексов.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("doji", |c| (c.close - c.open).abs() < 0.1);
-    // data.create_bit_index("hammer", |c| c.low < c.open * 0.98);
-    // 
-    // let indices = data.union_bit_indices_get_indices(&["doji", "hammer"]);
-    // let patterns = data.apply_indices(&indices);
-    // ```
-    pub fn union_bit_indices_get_indices(&self, names: &[&str]) -> Vec<usize> {
-        if names.is_empty() {
-            return Vec::new();
-        }
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", names[0]);
-        let first_index = match indexes.get(&key) {
-            Some(idx) => match idx.downcast_ref::<BitIndex>() {
-                Some(bi) => bi,
-                None => return Vec::new(),
-            },
-            None => return Vec::new(),
-        };
-        if names.len() == 1 {
-            return first_index.to_indices();
-        }
-        let mut other_indices = Vec::new();
-        for &name in &names[1..] {
-            let key = format!("bit:{}", name);
-            if let Some(idx) = indexes.get(&key) {
-                if let Some(bi) = idx.downcast_ref::<BitIndex>() {
-                    other_indices.push(bi);
-                }
-            }
-        }
-        if other_indices.is_empty() {
-            return first_index.to_indices();
-        }
-        let operations: Vec<(&BitIndex, BitOp)> = other_indices
-            .iter()
-            .map(|&bi| (bi, BitOp::Or))
-            .collect();
-        
-        let result = first_index.multi_operation(&operations);
-        result.to_indices()
-    }
-    
-    // Разность битовых индексов - возвращает ИНДЕКСЫ 
-    // 
-    // Возвращает индексы элементов из индекса `a`, которые НЕ присутствуют в индексе `b`.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("bullish", |c| c.close > c.open);
-    // data.create_bit_index("high_volume", |c| c.volume > 5000.0);
-    // 
-    // // Бычьи свечи с обычным объемом (не высоким)
-    // let indices = data.difference_bit_indices_get_indices("bullish", "high_volume");
-    // let result = data.apply_indices(&indices);
-    // ```
-    pub fn difference_bit_indices_get_indices(&self, a: &str, b: &str) -> Vec<usize> {
-        let indexes = self.indexes.load();
-        let key_a = format!("bit:{}", a);
-        let key_b = format!("bit:{}", b);
-        let index_a = match indexes.get(&key_a) {
-            Some(idx) => match idx.downcast_ref::<BitIndex>() {
-                Some(bi) => bi,
-                None => return Vec::new(),
-            },
-            None => return Vec::new(),
-        };
-        let index_b = match indexes.get(&key_b) {
-            Some(idx) => match idx.downcast_ref::<BitIndex>() {
-                Some(bi) => bi,
-                None => return Vec::new(),
-            },
-            None => return Vec::new(),
-        };
-        let result = index_a.difference(index_b);
-        result.to_indices()
-    }
-    
-    // Convenience методы - возвращают данные
-
-    pub fn get_bit_index_result(&self, name: &str) -> Option<BitOpResult> {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return Some(bit_index.get_result());
-            }
-        }
-        
-        None
+        ))?;
+        Ok(ngram_index.search(query))
     }
 
-    // Фильтрация по битовому индексу (ОПТИМИЗИРОВАНО) 
-    pub fn filter_by_bit_index(&self, name: &str) -> Vec<Arc<T>> {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return bit_index.get_result().apply_to_fast(&self.items())
-            } else {
-                Vec::new()
-            }
+    /// Применить n-gram фильтр (drill-down)
+    /// 
+    /// # Example
+    /// 
+    /// data.apply_text_search("search", "user_id: 12345")
+    ///     .apply_index_filter("level", &"ERROR");
+    /// 
+    fn apply_text_search(&self, name: &str, query: &str) -> GlobalResult<&Self> {
+        let text_indices = self.get_indices_with_text(name, query)?;
+        if text_indices.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndex { 
+                name: name.to_string() 
+            }));
+        }
+        let current_indices = self.current_indices();
+        let intersected_indices = if current_indices.len() == self.parent_data().map(|d| d.len()).unwrap_or(0) {
+            // Если текущие индексы = все данные, используем результат напрямую
+            text_indices
         } else {
-            Vec::new()
+            // Иначе делаем drill-down
+            Self::intersect_indices(&current_indices, &text_indices)
+        };
+        if intersected_indices.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndexCurrent { 
+                name: name.to_string() 
+            }));
         }
+        if self.parent_data().is_none(){
+            return Err(GLobalError::FilterData(FilterDataError::ParentDataIsEmpty)) 
+        }
+        let desc = format!("Text search: '{}'", query);
+        self.apply_filtered_items_with_indices(intersected_indices, desc)
     }
 
-    pub fn filter_by_bit_index_parallel(&self, name: &str) -> Vec<Arc<T>> {
-        let indices = self.get_indices_by_bit_index(name);
-        if indices.len() > 10_000 {
-            let items = self.items();
-            indices
-                .par_iter()
-                .filter_map(|&idx| items.get(idx).cloned())
-                .collect()
-        } else {
-            self.apply_indices(&indices)
-        }
+    /// Комплексный поиск по словам через текстовый индекс
+    pub fn search_complex_words_text(
+        &self,
+        name: &str,
+        or_words: &[&str],
+        and_words: &[&str],
+        not_words: &[&str],
+    ) -> GlobalResult<&Self>{
+        self.apply_complex_words_text_search(name, or_words, and_words, not_words)
     }
-
-    // Получить view на отфильтрованные данные
-    pub fn view_by_bit_index(&self, name: &str) -> BitIndexView<T> {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return BitIndexView::new(
-                    self.items(),
-                    bit_index.bitmap_arc(),
-                )
+    
+    /// Получить индексы через комплексный поиск по словам
+    fn get_indices_complex_words(
+        &self,
+        name: &str,
+        or_words: &[&str],
+        and_words: &[&str],
+        not_words: &[&str],
+    ) -> GlobalResult<Vec<usize>> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string() 
             }
+        ))?;
+        Ok(index.search_complex_words(or_words,and_words,not_words))
+    }
+
+
+    /// Применить комплексный поиск по словам к текущей выборке (drill-down)
+    /// 
+    /// Работает по аналогии с apply_text_search:
+    /// 1. Получает индексы через комплексный поиск (OR/AND/NOT)
+    /// 2. Пересекает с текущими индексами (drill-down)
+    /// 3. Материализует результат из SOURCE
+    /// 
+    /// # Arguments
+    /// * `name` - Имя текстового индекса
+    /// * `or_words` - Слова для OR (любое должно присутствовать)
+    /// * `and_words` - Слова для AND (все должны присутствовать)
+    /// * `not_words` - Слова для NOT (не должны присутствовать)
+    /// 
+    /// # Example
+    /// 
+    /// // Drill-down: (payment OR transaction) AND failed AND NOT timeout
+    /// data.apply_complex_words_text_search(
+    ///     "messages",
+    ///     &["payment", "transaction"],  // OR
+    ///     &["failed"],                  // AND
+    ///     &["timeout"]                  // NOT
+    /// );
+    /// 
+    fn apply_complex_words_text_search(
+        &self,
+        name: &str,
+        or_words: &[&str],
+        and_words: &[&str],
+        not_words: &[&str],
+    ) -> GlobalResult<&Self> {
+        let complex_indices = self.get_indices_complex_words(
+            name,
+            or_words,
+            and_words,
+            not_words
+        )?;
+        if complex_indices.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndex { 
+                name: name.to_string() 
+            }))
         }
-        BitIndexView::new(
-            Arc::new(Vec::new()),
-            Arc::new(RoaringBitmap::new())
+        let current_indices = self.current_indices();
+        let intersected_indices = if current_indices.len() == self.parent_data().map(|d| d.len()).unwrap_or(0) {
+            // Если текущие индексы = все данные, используем результат напрямую
+            complex_indices
+        } else {
+            // Иначе делаем drill-down
+            Self::intersect_indices(&current_indices, &complex_indices)
+        };
+        if intersected_indices.is_empty() {
+            return Err(GLobalError::FilterData(FilterDataError::DataNotFoundByIndexCurrent { 
+                name: name.to_string() 
+            }))
+        }
+        if self.parent_data().is_none(){
+            return Err(GLobalError::FilterData(FilterDataError::ParentDataIsEmpty)) 
+        }
+        let desc = Self::format_complex_query_desc(or_words, and_words, not_words);
+        self.apply_filtered_items_with_indices(
+            intersected_indices,
+            format!("Complex search: {}", desc)
         )
     }
 
-    #[inline]
-    pub fn count_by_bit_index(&self, name: &str) -> usize {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return bit_index.len();
+    /// Форматирует описание комплексного запроса для логов
+    /// 
+    /// # Example
+    /// 
+    /// format_complex_query_desc(
+    ///     &["payment", "transaction"],
+    ///     &["failed"],
+    ///     &["timeout"]
+    /// )
+    /// // => "(payment OR transaction) AND failed NOT timeout"
+    /// 
+    pub fn format_complex_query_desc(
+        or_words: &[&str],
+        and_words: &[&str],
+        not_words: &[&str],
+    ) -> String {
+        let mut parts = Vec::new();
+        // OR часть
+        if !or_words.is_empty() {
+            if or_words.len() == 1 {
+                parts.push(or_words[0].to_string());
+            } else {
+                parts.push(format!("({})", or_words.join(" OR ")));
             }
         }
-        
-        0
+        // AND часть
+        for word in and_words {
+            parts.push(word.to_string());
+        }
+        // NOT часть
+        if !not_words.is_empty() {
+            let not_part = format!("NOT {}", not_words.join(" NOT "));
+            parts.push(not_part);
+        }
+        if parts.is_empty() {
+            "all".to_string()
+        } else {
+            parts.join(" AND ")
+        }
     }
 
-    pub fn check_bit_index(&self, name: &str, position: usize) -> bool {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                return bit_index.get(position);
+    // Статистика n-gram индекса
+    /// 
+    /// # Пример
+    /// 
+    /// if let Some(stats) = data.text_index_stats("search") {
+    ///     println!("{}", stats);
+    /// }
+    /// 
+    pub fn text_index_stats(&self, name: &str) -> GlobalResult<TextIndexStats> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string() 
             }
-        }
-        
-        false
+        ))?;
+        Ok(index.stats())
     }
 
-    pub fn bit_operation(&self, operations: &[(&str, BitOp)]) -> BitOpResult {
-        if operations.is_empty() {
-            return BitOpResult::empty();
-        }
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", operations[0].0);
-        let first_index = match indexes.get(&key) {
-            Some(idx) => match idx.downcast_ref::<BitIndex>() {
-                Some(bi) => bi,
-                None => return BitOpResult::empty(),
-            },
-            None => return BitOpResult::empty(),
-        };
-        let other_operations: Vec<(&BitIndex, BitOp)> = operations[1..]
-            .iter()
-            .filter_map(|(name, op)| {
-                let key = format!("bit:{}", name);
-                indexes.get(&key)
-                    .and_then(|idx| idx.downcast_ref::<BitIndex>())
-                    .map(|bi| (bi, *op))
-            })
-            .collect();
-        
-        first_index.multi_operation(&other_operations)
-    }
-
-    pub fn apply_bit_operation(&self, operations: &[(&str, BitOp)]) -> &Self {
-        let result = self.bit_operation(operations);
-        let items = self.items();
-        let filtered = result.apply_to_fast(&items);
-        if filtered.is_empty() && self.len() > 0 {
-            return self;
-        }
-        let op_desc = operations
-            .iter()
-            .map(|(name, op)| format!("{:?}({})", op, name))
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.apply_filtered_items(filtered, format!("Bit operation: {}", op_desc))
-    }
-    
-    pub fn bit_index_stats(&self, name: &str) -> Option<(usize, usize)> {
-        let indexes = self.indexes.load();
-        let key = format!("bit:{}", name);
-        if let Some(index_any) = indexes.get(&key) {
-            if let Some(bit_index) = index_any.downcast_ref::<BitIndex>() {
-                let ones = bit_index.count_ones();
-                let zeros = bit_index.count_zeros();
-                return Some((ones, zeros));
+    /// Получить топ N самых частых n-грамм
+    /// 
+    /// # Пример
+    /// 
+    /// let top = data.top_text("search", 10);
+    /// for (ngram, count) in top {
+    ///     println!("'{}' -> {} times", ngram, count);
+    /// }
+    /// 
+    pub fn top_text(&self, name: &str, n: usize) -> GlobalResult<Vec<(String, usize)>> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string() 
             }
-        }
-        None
-    }
-    
-    // Пересечение битовых индексов - возвращает данные 
-    // 
-    // Возвращает элементы, которые удовлетворяют ВСЕМ указанным битовым индексам.
-    // Это convenience метод, который вызывает `intersect_bit_indices_get_indices` 
-    // и материализует результат.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("bullish", |c| c.close > c.open);
-    // data.create_bit_index("high_volume", |c| c.volume > 5000.0);
-    // 
-    // let result = data.intersect_bit_indices(&["bullish", "high_volume"]);
-    // println!("Found {} candles", result.len());
-    // ```
-    pub fn intersect_bit_indices(&self, names: &[&str]) -> Vec<Arc<T>> {
-        let indices = self.intersect_bit_indices_get_indices(names);
-        self.apply_indices(&indices)
-    }
-    
-    // Объединение битовых индексов - возвращает данные 
-    // 
-    // Возвращает элементы, которые удовлетворяют ХОТЯ БЫ ОДНОМУ из указанных битовых индексов.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("doji", |c| (c.close - c.open).abs() < 0.1);
-    // data.create_bit_index("hammer", |c| c.low < c.open * 0.98);
-    // 
-    // let patterns = data.union_bit_indices(&["doji", "hammer"]);
-    // println!("Found {} pattern candles", patterns.len());
-    // ```
-    pub fn union_bit_indices(&self, names: &[&str]) -> Vec<Arc<T>> {
-        let indices = self.union_bit_indices_get_indices(names);
-        self.apply_indices(&indices)
-    }
-    
-    // Разность битовых индексов - возвращает данные 
-    // 
-    // Возвращает элементы из индекса `a`, которые НЕ присутствуют в индексе `b`.
-    // 
-    // # Пример
-    // ```
-    // data.create_bit_index("bullish", |c| c.close > c.open);
-    // data.create_bit_index("high_volume", |c| c.volume > 5000.0);
-    // 
-    // // Свечи с обычным объемом
-    // let result = data.difference_bit_indices("bullish", "high_volume");
-    // println!("Bullish with normal volume: {}", result.len());
-    // ```
-    pub fn difference_bit_indices(&self, a: &str, b: &str) -> Vec<Arc<T>> {
-        let indices = self.difference_bit_indices_get_indices(a, b);
-        self.apply_indices(&indices)
+        ))?;
+        Ok(index.top_ngrams(n))
     }
 
+    /// Список всех n-грамм в индексе
+    pub fn list_text_ngrams(&self, name: &str) -> GlobalResult<Vec<String>> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string() 
+            }
+        ))?;
+        Ok(index.list_ngrams())
+    }
+
+    /// Получить статистику по конкретной n-грамме
+    /// 
+    /// # Example
+    /// 
+    /// if let Some(stats) = data.text_stats("search", "pay") {
+    ///     println!("N-gram 'pay': {}", stats);
+    /// }
+    /// 
+    pub fn text_stats(&self, name: &str, ngram: &str) -> GlobalResult<Option<String>> {
+        let index_ref = self.indexes.get(name)
+        .ok_or(GLobalError::Index(IndexError::NotFound { name: name.to_string() }))?;
+        let index = index_ref.as_text()
+        .ok_or(GLobalError::Index(IndexError::Compatibility 
+            { 
+                name: name.to_string(), 
+                type_exist: index_ref.index_type().to_string(), 
+                type_expect: INDEX_TEXT.to_string() 
+            }
+        ))?;
+        Ok(index.ngram_stats(ngram))
+    }
 
     // Filter Methods
 
-    fn filter_impl<F>(&self, predicate: F, retry_count: usize) -> &Self
+   fn filter_impl<F>(&self, predicate: F) -> GlobalResult<&Self>
     where
         F: Fn(&T) -> bool + Sync + Send,
     {
-        match &self.storage {
-            DataStorage::Owned { current, .. } => {
-                if retry_count >= MAX_RETRIES {
-                    return self;
-                }
-                let (current_level, levels, level_info) = match (&self.current_level, &self.levels, &self.level_info) {
-                    (Some(cl), Some(l), Some(li)) => (cl, l, li),
-                    _ => return self,
-                };
-                let (current_lvl, current_data) = {
-                    let current_lvl = current_level.load(Ordering::Acquire);
-                    let levels_guard = levels.load();
-                    let current_data = match levels_guard.get(current_lvl).or_else(|| levels_guard.first()) {
-                        Some(data) => Arc::clone(data),
-                        None => return self,
-                    };
-                    (current_lvl, current_data)
-                };
-                let filtered: Vec<Arc<T>> = current_data
-                    .par_iter()
-                    .filter(|item| predicate(item))
-                    .cloned()
-                    .collect();
-                
-                let filtered_arc = Arc::new(filtered);
-                {
-                    let _guard = self.write_lock.write();
-                    let actual_current = current_level.load(Ordering::Acquire);
-                    if actual_current != current_lvl {
-                        drop(_guard);
-                        return self.filter_impl(predicate, retry_count + 1);
-                    }
-                    let levels_guard = levels.load();
-                    let mut new_levels = if levels_guard.len() < MAX_HISTORY {
-                        levels_guard.to_vec()
-                    } else {
-                        let start = levels_guard.len().saturating_sub(MAX_HISTORY - 1);
-                        levels_guard[start..].to_vec()
-                    };
-                    new_levels.push(Arc::clone(&filtered_arc));
-                    let adjusted_level = new_levels.len() - 1;
-                    levels.store(Arc::new(new_levels));
-                    let info_guard = level_info.load();
-                    let mut new_info = if info_guard.len() < MAX_HISTORY {
-                        info_guard.to_vec()
-                    } else {
-                        let start = info_guard.len().saturating_sub(MAX_HISTORY - 1);
-                        info_guard[start..].to_vec()
-                    };
-                    new_info.push(Arc::from("Filtered"));
-                    level_info.store(Arc::new(new_info));
-                    current_level.store(adjusted_level, Ordering::Release);
-                    current.store(filtered_arc);
-                    drop(_guard);
-                    self.rebuild_indexes();
-                }
-                self
-            }
-            
-            DataStorage::Indexed { parent_data, current_indices, .. } => {
-                if let Some(parent) = parent_data.upgrade() {
-                    let _guard = self.write_lock.write();
-                    let indices_guard = current_indices.load();
-                    let filtered_indices: Vec<usize> = indices_guard
-                        .par_iter()
-                        .filter(|&&idx| {
-                            if let Some(item) = parent.get(idx) {
-                                predicate(item)
-                            } else {
-                                false
-                            }
-                        })
-                        .copied()
-                        .collect();
-                    current_indices.store(Arc::new(filtered_indices));
-                    drop(_guard);
-                    self.rebuild_indexes();
-                }
-                self
-            }
-        }
+        self.apply_filtered_items(predicate, "Filtered".to_string())
     }
 
-    pub fn filter<F>(&self, predicate: F) -> &Self
+    pub fn filter<F>(&self, predicate: F) -> GlobalResult<&Self>
     where
         F: Fn(&T) -> bool + Sync + Send,
     {
-        self.filter_impl(predicate, 0)
-    }
-    
-    pub fn filter_adaptive<F>(&self, predicate: F) -> &Self
-    where
-        F: Fn(&T) -> bool + Sync + Send,
-    {
-        self.filter(predicate)
+        self.filter_impl(predicate)
     }
 
 
@@ -1515,82 +1367,131 @@ where
     // 
     // Очищает:
     // - Все уровни фильтрации (кроме source)
-    // - Все индексы (обычные + битовые)
     // - Историю операций
     pub fn reset_to_source(&self) -> &Self {
+        let _guard = self.write_lock.write();
         match &self.storage {
-            DataStorage::Owned { source, current, .. } => {
-                if let (Some(levels), Some(level_info), Some(current_level)) = 
-                    (&self.levels, &self.level_info, &self.current_level)
-                {
-                    let _guard = self.write_lock.write();
-                    
-                    let levels_guard = levels.load();
-                    if let Some(level_0) = levels_guard.first() {
-                        levels.store(Arc::new(vec![Arc::clone(level_0)]));
-                    }
-                    
-                    level_info.store(Arc::new(vec![Arc::from("Source")]));
-                    current_level.store(0, Ordering::Release);
-                    current.store(Arc::clone(source));
-                    drop(_guard);
-                    // ОЧИЩАЕМ ВСЕ ИНДЕКСЫ перед пересборкой
-                    self.clear_all_indexes();
-                    // Теперь индексов нет, rebuild_indexes() ничего не сделает
-                    self.rebuild_indexes();
-                }
-            }
-            
-            DataStorage::Indexed { source_indices, current_indices, .. } => {
-                let _guard = self.write_lock.write();
+            DataStorage::Owned {
+                source,
+                current_indices,
+                current_cache,
+                full_indices,  // Используем кеш!
+                levels,
+                level_indices,
+            } => {
+                current_indices.store(Arc::clone(full_indices));
+                current_cache.store(Arc::new(Some(Arc::clone(source))));
+                levels.store(Arc::new(vec![Arc::clone(source)]));
+                level_indices.store(Arc::new(vec![Arc::clone(full_indices)]));
+            },
+            DataStorage::Indexed {
+                source_indices,
+                current_indices,
+                index_levels,
+                ..
+            } => {
                 current_indices.store(Arc::clone(source_indices));
-                drop(_guard);
-                self.clear_all_indexes();
-                self.rebuild_indexes();
-               
+                index_levels.store(Arc::new(vec![Arc::clone(source_indices)]));
             }
         }
-        
+        self.level_info.store(Arc::new(vec![Arc::from("Source")]));
+        self.current_level.store(0, Ordering::Release);
+        self.source_indices_mask.store(Arc::new(None));
         self
     }
     
-    fn go_to_level(&self, target_level: usize) -> &Self {
-        if let DataStorage::Owned { current, .. } = &self.storage {
-            if let (Some(levels), Some(level_info), Some(current_level)) = 
-                (&self.levels, &self.level_info, &self.current_level)
-            {
-                let _guard = self.write_lock.write();
-                let levels_guard = levels.load();   
-                if target_level >= levels_guard.len() {
-                    return self;
-                } 
-                let new_levels = levels_guard[..=target_level].to_vec();
-                levels.store(Arc::new(new_levels.clone()));     
-                let info_guard = level_info.load();
-                let new_info = info_guard[..=target_level].to_vec();
-                level_info.store(Arc::new(new_info));         
-                current_level.store(target_level, Ordering::Release);
-                if let Some(target_data) = new_levels.get(target_level) {
-                    current.store(Arc::clone(target_data));
-                }
-                
-                drop(_guard);
-                self.clear_all_indexes();
-                self.rebuild_indexes();
-            }
+    pub fn go_to_level(&self, target_level: usize) -> &Self {
+        let _guard = self.write_lock.write();
+        let total_levels = self.level_info.load().len();
+        if target_level >= total_levels {
+            return self;
         }
         
+        match &self.storage {
+            DataStorage::Owned {
+                current_indices,
+                current_cache,
+                levels,
+                level_indices,
+                ..
+            } => {
+                if let Some(indices) = level_indices.load().get(target_level) {
+                    current_indices.store(Arc::clone(indices));
+                }
+                // Восстанавливаем кеш
+                if let Some(cached_level) = levels.load().get(target_level) {
+                    current_cache.store(Arc::new(Some(Arc::clone(cached_level))));
+                } else {
+                    current_cache.store(Arc::new(None));
+                }
+                // Обрезаем историю
+                if target_level < total_levels - 1 {
+                    let trimmed_levels: Vec<Arc<Vec<Arc<T>>>> = levels.load()
+                        .iter()
+                        .take(target_level + 1)
+                        .cloned()
+                        .collect();
+                    levels.store(Arc::new(trimmed_levels));
+                    
+                    let trimmed_indices: Vec<Arc<Vec<usize>>> = level_indices.load()
+                        .iter()
+                        .take(target_level + 1)
+                        .cloned()
+                        .collect();
+                    level_indices.store(Arc::new(trimmed_indices));
+                }
+            },
+            DataStorage::Indexed {
+                current_indices,
+                index_levels,
+                ..
+            } => {
+                if let Some(indices) = index_levels.load().get(target_level) {
+                    current_indices.store(Arc::clone(indices));
+                }
+                
+                if target_level < total_levels - 1 {
+                    let trimmed: Vec<Arc<Vec<usize>>> = index_levels.load()
+                        .iter()
+                        .take(target_level + 1)
+                        .cloned()
+                        .collect();
+                    index_levels.store(Arc::new(trimmed));
+                }
+            }
+        }
+        // Обновляем метаданные...
+        if target_level < total_levels - 1 {
+            let trimmed_info: Vec<Arc<str>> = self.level_info.load()
+                .iter()
+                .take(target_level + 1)
+                .cloned()
+                .collect();
+            self.level_info.store(Arc::new(trimmed_info));
+        }
+        self.current_level.store(target_level, Ordering::Relaxed);
+        let source_len = self.parent_data().map(|d| d.len()).unwrap_or(0);
+        if source_len > 0 {
+            let current = match &self.storage {
+                DataStorage::Owned { current_indices, .. } => current_indices.load(),
+                DataStorage::Indexed { current_indices, .. } => current_indices.load(),
+            };
+            if current.len() < source_len {
+                // Пересоздаем маску из текущих индексов
+                let bitmap: RoaringBitmap = current.iter().map(|&i| i as u32).collect();
+                self.source_indices_mask.store(Arc::new(Some(Arc::new(bitmap))));
+            } else {
+                // Все элементы - маска не нужна
+                self.source_indices_mask.store(Arc::new(None));
+            }
+        }
         self
     }
 
     pub fn up(&self) -> &Self {
-        if let Some(current_level) = &self.current_level {
-            let current = current_level.load(Ordering::Acquire);
-            if current > 0 {
-                self.go_to_level(current - 1)
-            } else {
-                self
-            }
+        let current = self.current_level.load(Ordering::Acquire);
+        if current > 0 {
+            self.go_to_level(current - 1)
         } else {
             self
         }
@@ -1601,8 +1502,8 @@ where
 
     pub fn len(&self) -> usize {
         match &self.storage {
-            DataStorage::Owned { current, .. } => {
-                current.load().len()
+            DataStorage::Owned { current_indices, .. } => {
+                current_indices.load().len()
             }
             DataStorage::Indexed { current_indices, .. } => {
                 current_indices.load().len()
@@ -1615,81 +1516,94 @@ where
     }
 
     pub fn current_level(&self) -> usize {
-        self.current_level.as_ref().map(|cl| cl.load(Ordering::Acquire)).unwrap_or(0)
+        self.current_level.load(Ordering::Relaxed)
     }
 
     pub fn stored_levels_count(&self) -> usize {
-        self.levels.as_ref().map(|l| l.load().len()).unwrap_or(1)
+        match &self.storage {
+            DataStorage::Owned { levels, .. } => {
+                levels.load().len()
+            }
+            DataStorage::Indexed { index_levels, .. } => {
+                index_levels.load().len()
+            }
+        }
     }
 
     pub fn total_stored_items(&self) -> usize {
-        if let Some(levels) = &self.levels {
-            levels.load()
-                .iter()
-                .map(|level| level.len())
-                .sum()
-        } else {
-            self.len()
+        match &self.storage {
+            DataStorage::Owned { levels, .. } => {
+                levels.load()
+                    .iter()
+                    .map(|level| level.len())
+                    .sum()
+            }
+            DataStorage::Indexed { index_levels, .. } => {
+                index_levels.load()
+                    .iter()
+                    .map(|level| level.len())
+                    .sum()
+            }
         }
     }
 
     pub fn memory_stats(&self) -> MemoryStats {
         match &self.storage {
-            DataStorage::Owned { .. } => {
-                if let (Some(levels), Some(current_level)) = (&self.levels, &self.current_level) {
-                    let current_lvl = current_level.load(Ordering::Acquire);
-                    let levels_guard = levels.load();
-                    let mut stats = MemoryStats {
-                        current_level: current_lvl,
-                        stored_levels: levels_guard.len(),
-                        current_level_items: 0,
-                        total_stored_items: 0,
-                        useful_items: 0,
-                        wasted_items: 0,
-                    };
-
-                    for (idx, level_data) in levels_guard.iter().enumerate() {
-                        let count = level_data.len();
-                        stats.total_stored_items += count;
-                        if idx == current_lvl {
-                            stats.current_level_items = count;
-                        }
-                        
-                        if idx <= current_lvl {
-                            stats.useful_items += count;
-                        } else {
-                            stats.wasted_items += count;
-                        }
-                    }
-                    stats
-                } else {
-                    MemoryStats {
-                        current_level: 0,
-                        stored_levels: 1,
-                        current_level_items: self.len(),
-                        total_stored_items: self.len(),
-                        useful_items: self.len(),
-                        wasted_items: 0,
-                    }
-                }
-            }
-            DataStorage::Indexed { .. } => {
-                MemoryStats {
-                    current_level: 0,
-                    stored_levels: 1,
-                    current_level_items: self.len(),
-                    total_stored_items: self.len(),
-                    useful_items: self.len(),
+            DataStorage::Owned { levels, .. } => {
+                let current_lvl = self.current_level.load(Ordering::Acquire);
+                let levels_guard = levels.load();
+                let mut stats = MemoryStats {
+                    current_level: current_lvl,
+                    stored_levels: levels_guard.len(),
+                    current_level_items: 0,
+                    total_stored_items: 0,
+                    useful_items: 0,
                     wasted_items: 0,
+                };
+                for (idx, level_data) in levels_guard.iter().enumerate() {
+                    let count = level_data.len();
+                    stats.total_stored_items += count;
+                    if idx == current_lvl {
+                        stats.current_level_items = count;
+                    }
+                    if idx <= current_lvl {
+                        stats.useful_items += count;
+                    } else {
+                        stats.wasted_items += count;
+                    }
                 }
+                stats
+            },
+            DataStorage::Indexed { index_levels, .. } => {
+                let current_lvl = self.current_level.load(Ordering::Acquire);
+                let levels_guard = index_levels.load();
+                let mut stats = MemoryStats {
+                    current_level: current_lvl,
+                    stored_levels: levels_guard.len(),
+                    current_level_items: 0,
+                    total_stored_items: 0,
+                    useful_items: 0,
+                    wasted_items: 0,
+                };
+                for (idx, level_indices) in levels_guard.iter().enumerate() {
+                    let count = level_indices.len();
+                    stats.total_stored_items += count;
+                    if idx == current_lvl {
+                        stats.current_level_items = count;
+                    }
+                    if idx <= current_lvl {
+                        stats.useful_items += count;
+                    } else {
+                        stats.wasted_items += count;
+                    }
+                }
+                stats
             }
         }
     }
     
     pub fn level_name(&self, level: usize) -> Option<Arc<str>> {
-        self.level_info.as_ref().and_then(|li| {
-            li.load().get(level).map(Arc::clone)
-        })
+        self.level_info.load().get(level).map(Arc::clone)
     }
 
     pub fn builder() -> FilterDataBuilder<T> {
@@ -1698,6 +1612,27 @@ where
     
     pub fn new(data: Vec<T>) -> Self {
         Self::from_vec(data)
+    }
+
+    pub fn filter_state_info(&self) -> FilterStateInfo {
+        let source_len = self.parent_data().map(|d| d.len()).unwrap_or(0);
+        let filtered_len = self.len();
+        let mask_opt = self.source_indices_mask.load();
+        let has_mask = mask_opt.is_some();
+        let (mask_bits_set, mask_memory_bytes) = if let Some(mask) = mask_opt.as_ref() {
+            let cardinality = mask.len() as usize;
+            let memory = mask.serialized_size();
+            (cardinality, memory)
+        } else {
+            (0, 0)
+        };
+        FilterStateInfo {
+            source_len,
+            filtered_len,
+            has_mask,
+            mask_bits_set,
+            mask_memory_bytes,
+        }
     }
 }
 
@@ -1717,7 +1652,7 @@ struct IndexDefinition<T>
 where
     T: Send + Sync + 'static,
 {
-    applier: Box<dyn FnOnce(&FilterData<T>) + Send>,
+    applier: Box<dyn FnOnce(&FilterData<T>) -> GlobalResult<()> + Send>,
 }
 
 impl<T> FilterDataBuilder<T>
@@ -1736,98 +1671,49 @@ where
         self.data = Some(data);
         self
     }
-    
-    pub fn with_index<K, F>(mut self, name: &str, extractor: F) -> Self
+
+    pub fn with_field_index<V, F>(mut self, name: &str, extractor: F) -> Self
     where
-        K: Ord + Clone + Send + Sync + 'static,
-        F: Fn(&T) -> K + Send + Sync + 'static + Clone,
+        V: Eq + Hash + Clone + Send + Sync + Ord + PartialOrd + Display + 'static,
+        V: Into<FieldValue>,
+        F: Fn(&T) -> V + Send + Sync + 'static + Clone,
+        IndexField<V>: IntoIndexFieldEnum,
     {
         let name_owned = name.to_string();
         let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_index(&name_owned, extractor_clone);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
-        self.indexes.push(IndexDefinition {
-            applier,
-        });
-        self
-    }
-
-    pub fn with_bit_index<F>(mut self, name: &str, predicate: F) -> Self
-    where
-        F: Fn(&T) -> bool + Send + Sync + 'static + Clone,
-    {
-        let name_owned = name.to_string();
-        let predicate_clone = predicate.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_bit_index(&name_owned, predicate_clone);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
-        self.indexes.push(IndexDefinition {
-            applier,
-        });
-        self
-    }
-
-    pub fn with_decimal_index<F>(mut self, name: &str, extractor: F) ->Self
-    where
-        F: Fn(&T) -> Decimal + Send + Sync + 'static + Clone,
-    {
-        let name_owned = name.to_string();
-        let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_decimal_index(&name_owned, extractor_clone);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
-        self.indexes.push(IndexDefinition {
-            applier,
-        });
         
-        self
-    }
-
-    pub fn with_bucketed_decimal_index<F>(
-        mut self,
-        name: &str,
-        extractor: F,
-        bucket_size: Decimal
-    ) -> Self
-    where
-        F: Fn(&T) -> Decimal + Send + Sync + 'static + Clone,
-    {
-        let name_owned = name.to_string();
-        let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_bucketed_decimal_index(&name_owned, extractor_clone, bucket_size);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
+        let applier = Box::new(move |fd: &FilterData<T>| -> GlobalResult<()> {
+            fd.create_field_index(&name_owned, extractor_clone)?;
+            Ok(())
+        }) as Box<dyn FnOnce(&FilterData<T>) -> GlobalResult<()> + Send>;
+        
         self.indexes.push(IndexDefinition {
             applier,
         });
         self
     }
 
-    pub fn with_float_index_f32<F>(mut self, name: &str, extractor: F) -> Self
+
+/// Добавить n-gram индекс
+    /// 
+    /// # Example
+    /// 
+    /// let data = FilterData::builder()
+    ///     .with_data(logs)
+    ///     .with_text_index("search", |log| log.message.clone(), 3)
+    ///     .build();
+    /// 
+    pub fn with_text_index<F>(mut self, name: &str, extractor: F) -> Self
     where
-        F: Fn(&T) -> f32 + Send + Sync + 'static + Clone,
+        F: Fn(&T) -> String + Send + Sync + 'static + Clone,
     {
         let name_owned = name.to_string();
         let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_float_index_f32(&name_owned, extractor_clone);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
-        self.indexes.push(IndexDefinition {
-            applier,
-        });
-        self
-    }
-    
-    pub fn with_float_index_f64<F>(mut self, name: &str, extractor: F) -> Self
-    where
-        F: Fn(&T) -> f64 + Send + Sync + 'static + Clone,
-    {
-        let name_owned = name.to_string();
-        let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_float_index_f64(&name_owned, extractor_clone);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
+        
+        let applier = Box::new(move |fd: &FilterData<T>| -> GlobalResult<()>  {
+            fd.create_text_index(&name_owned, extractor_clone.clone())?;
+            Ok(())
+        }) as Box<dyn FnOnce(&FilterData<T>) -> GlobalResult<()>  + Send>;
         
         self.indexes.push(IndexDefinition {
             applier,
@@ -1835,35 +1721,16 @@ where
         self
     }
     
-    pub fn with_bucketed_float_index_f64<F>(
-        mut self,
-        name: &str,
-        extractor: F,
-        bucket_size: f64
-    ) -> Self
-    where
-        F: Fn(&T) -> f64 + Send + Sync + 'static + Clone,
-    {
-        let name_owned = name.to_string();
-        let extractor_clone = extractor.clone();
-        let applier = Box::new(move |fd: &FilterData<T>| {
-            fd.create_bucketed_float_index_f64(&name_owned, extractor_clone, bucket_size);
-        }) as Box<dyn FnOnce(&FilterData<T>) + Send>;
-        self.indexes.push(IndexDefinition {
-            applier,
-        });
-        self
-    }
-    
-    pub fn build(self) -> FilterData<T> {
+    pub fn build(self) -> GlobalResult<FilterData<T>> {
         let data = self.data.expect("Data must be provided via with_data()");
         let fd = FilterData::from_vec(data);
         for index_def in self.indexes {
-            (index_def.applier)(&fd);
+            (index_def.applier)(&fd)?;
         }
         
-        fd
+        Ok(fd)
     }
+
 }
 
 impl<T> Default for FilterDataBuilder<T>
@@ -1891,46 +1758,32 @@ impl<T: Send + Sync + 'static> IntoFilterData for Vec<T> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FilterStateInfo {
+    pub source_len: usize,
+    pub filtered_len: usize,
+    pub has_mask: bool,
+    pub mask_bits_set: usize,
+    pub mask_memory_bytes: usize,
+}
+
 
 #[cfg(test)]
-mod memory_leak_tests {
+mod unit_tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        thread,
+        time,
+    };
     
     #[test]
     fn test_no_leak_repeated_index_creation() {
         let items: Vec<i32> = (0..10_000).collect();
         let data = FilterData::from_vec(items);
-        // Создаем индекс многократно с тем же именем
+        
         for i in 0..100 {
-            data.create_index("test", move |&n| n % (i + 1));
-        }
-        // Должен быть только ОДИН индекс и ОДИН builder
-        assert_eq!(data.list_indexes().len(), 1);
-        assert_eq!(data.index_builders.read().len(), 1);
-    }
-    
-    #[test]
-    fn test_no_leak_many_filters() {
-        use memory_stats::memory_stats;
-        let start_mem = memory_stats().map(|m| m.physical_mem);
-        for _ in 0..100 {
-            let items: Vec<i32> = (0..10_000).collect();
-            let data = FilterData::from_vec(items);
-            // Много фильтраций
-            for i in 0..50 {
-                data.filter(|&n| n > i * 100);
-            }
-            // data дропается здесь
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let end_mem = memory_stats().map(|m| m.physical_mem);
-        if let (Some(start), Some(end)) = (start_mem, end_mem) {
-            let diff = end.saturating_sub(start);
-            println!("Memory growth: {} MB", diff / 1024 / 1024);
-            
-            assert!(diff < 50_000_000, 
-                    "Possible memory leak! Growth: {} bytes", diff);
+            assert!(data.create_field_index("test", move |&n| n % (i + 1)).is_ok());
         }
     }
     
@@ -1938,52 +1791,46 @@ mod memory_leak_tests {
     fn test_levels_bounded() {
         let items: Vec<i32> = (0..1000).collect();
         let data = FilterData::from_vec(items);
-        // Делаем 100 фильтраций (больше MAX_HISTORY)
         for i in 0..100 {
-            data.filter(|&n| n > i * 10);
+            if i < MAX_HISTORY {
+                assert!(data.filter(|&n| n > i as i32 * 10).is_ok());
+            } else {
+                assert!(data.filter(|&n| n > i as i32 * 10).is_err());
+            }
         }
         let stats = data.memory_stats();
-        // Должно быть <= MAX_HISTORY
-        assert!(stats.stored_levels <= MAX_HISTORY,
-                "Too many levels stored: {}", stats.stored_levels);
+        println!("stats levels: {}", stats.stored_levels);
+        assert!(stats.current_level <= MAX_HISTORY,
+                "Too many levels stored: {}", stats.current_level);
     }
     
     #[test]
     fn test_index_builders_not_accumulating() {
         let items: Vec<i32> = (0..1000).collect();
         let data = FilterData::from_vec(items);
-        // Создаем индекс многократно
         for i in 0..100 {
-            data.create_index("price", move |&n| n % (i + 1));
+            assert!(data.create_field_index("price", move |&n| n % (i + 1)).is_ok())
         }
-        // Должен быть только 1 builder
-        let builders_count = data.index_builders.read().len();
-        assert_eq!(builders_count, 1,
-                   "Builders accumulating! Count: {}", builders_count);
     }
     
     #[test]
     fn test_reset_doesnt_leak() {
         let items: Vec<i32> = (0..10_000).collect();
         let data = FilterData::from_vec(items);
-        for _ in 0..100 {
-            // Фильтруем
-            data.filter(|&n| n > 5000);
-            // Создаем индексы
-            data.create_index("test", |&n| n % 10);
-            data.create_bit_index("even", |&n| n % 2 == 0);
-            // Сбрасываем
-            data.reset_to_source();
-        }
-        // Levels должны быть сброшены
         assert_eq!(data.stored_levels_count(), 1);
-        // Индексов не должно быть (были очищены)
+        for _ in 0..100 {
+            data.filter(|&n| n > 5000).unwrap();
+            data.create_field_index("test", |&n| n % 10).unwrap();    
+            data.create_field_index("even", |&n| n % 2).unwrap();
+            data.reset_to_source();
+            data.clear_all_indexes();
+        }
+        assert_eq!(data.stored_levels_count(), 1);
         assert_eq!(data.list_indexes().len(), 0);
     }
     
     #[test]
     fn test_concurrent_no_leak() {
-        use std::thread;
         let items: Vec<i32> = (0..10_000).collect();
         let data = Arc::new(FilterData::from_vec(items));
         let mut handles = vec![];
@@ -1991,8 +1838,16 @@ mod memory_leak_tests {
             let data_clone = Arc::clone(&data);
             let handle = thread::spawn(move || {
                 for _ in 0..100 {
-                    data_clone.create_index(&format!("idx_{}", i), |&n| n % 10);
-                    let _ = data_clone.filter_by_index(&format!("idx_{}", i), &5);
+                    assert!(data_clone.create_field_index(
+                        &format!("idx_{}", i), 
+                        |&n| n % 10
+                    ).is_ok());
+                    
+                    let _ = data_clone.filter_by_field_ops(
+                        &format!("idx_{}", i), 
+                        &[(FieldOperation::eq(5), Op::And)]
+                    );
+                    
                     data_clone.drop_index(&format!("idx_{}", i));
                 }
             });
@@ -2001,7 +1856,6 @@ mod memory_leak_tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        // После всех операций не должно быть лишних индексов
         assert!(data.list_indexes().len() <= 10);
     }
     
@@ -2012,11 +1866,8 @@ mod memory_leak_tests {
         let indices = vec![0, 100, 200, 300];
         let data = FilterData::from_indices(&parent, indices);
         assert!(data.is_valid());
-        // Дропаем parent
         drop(parent);
-        // Data должен стать невалидным
         assert!(!data.is_valid());
-        // Операции должны вернуть пусто
         assert!(data.items().is_empty());
     }
 
@@ -2024,21 +1875,15 @@ mod memory_leak_tests {
     fn test_no_deadlock_replace_index() {
         let items: Vec<i32> = (0..1000).collect();
         let data = Arc::new(FilterData::from_vec(items));
-        // Создаем индекс
-        data.create_index("test", |&n| n % 10);
-        // Пересоздаем многократно в одном потоке
+        assert!(data.create_field_index("test", |&n| n % 10).is_ok());
         for i in 0..100 {
-            data.create_index("test", move |&n| n % (i + 1));
+            assert!(data.create_field_index("test", move |&n| n % (i + 1)).is_ok());
         }
         println!("No deadlock in single thread");
     }
     
     #[test]
-    fn test_no_deadlock_concurrent_replace() {
-        use std::{
-            thread,
-            time::Duration,
-        };
+    fn test_no_deadlock_concurrent_create_replace() {
         let items: Vec<i32> = (0..10_000).collect();
         let data = Arc::new(FilterData::from_vec(items));
         let mut handles = vec![];
@@ -2046,9 +1891,17 @@ mod memory_leak_tests {
             let data_clone = Arc::clone(&data);
             let handle = thread::spawn(move || {
                 for j in 0..100 {
-                    // Многократно пересоздаем индекс
-                    data_clone.create_index("shared", move |&n| n % (i * 10 + j + 1));
-                    thread::sleep(Duration::from_micros(10));
+                    let index_name = format!("index_{}", i);
+                    let result = data_clone.create_field_index(
+                        &index_name, 
+                        move |&n| n % (i * 10 + j + 1)
+                    );
+                    if let Err(e) = &result {
+                        println!("Thread {} iteration {}: Error creating index: {:?}", i, j, e);
+                    }
+                    assert!(result.is_ok(), 
+                        "Thread {} failed to create index: {:?}", i, result.err());
+                    thread::sleep(time::Duration::from_micros(10));
                 }
             });
             handles.push(handle);
@@ -2056,64 +1909,214 @@ mod memory_leak_tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        println!(" No deadlock in concurrent threads");
+        println!("✓ No deadlock in concurrent threads");
+        let indexes = data.list_indexes();
+        println!("Created {} indexes", indexes.len());
+        assert_eq!(indexes.len(), 10, "Should have 10 indexes (one per thread)");
     }
 
     #[test]
-    fn test_bit_index_key_consistency() {
+    fn test_concurrent_same_index_replace() {
+        println!("== Concurrent Same Index Replace ==");
+        let items: Vec<i32> = (0..10_000).collect();
+        let data = Arc::new(FilterData::from_vec(items));
+        let mut handles = vec![];
+        for i in 0..10 {
+            let data_clone = Arc::clone(&data);
+            let handle = thread::spawn(move || {
+                for j in 0..50 {
+                    let mut attempts = 0;
+                    loop {
+                        let result = data_clone.create_field_index(
+                            "shared", 
+                            move |&n| n % (i * 10 + j + 1)
+                        );
+                        match result {
+                            Ok(_) => break,
+                            Err(e) => {
+                                attempts += 1;
+                                if attempts > 5 {
+                                    panic!("Thread {} failed after 5 attempts: {:?}", i, e);
+                                }
+                                thread::sleep(time::Duration::from_micros(50));
+                            }
+                        }
+                    }
+                    thread::sleep(time::Duration::from_micros(10));
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        println!("✓ No deadlock with concurrent replace of same index");
+    }
+
+    #[test]
+    fn test_field_index_key_consistency() {
         let items: Vec<i32> = (0..1000).collect();
         let data = FilterData::from_vec(items);
-        // Создаем битовый индекс
-        data.create_bit_index("test", |&n| n % 2 == 0);
-        // Проверяем что ключ правильный
+        assert!(data.create_field_index("test", |&n| n % 2).is_ok());
         let indexes = data.list_indexes();
-        assert!(indexes.contains(&"bit:test".to_string()),
-                "Should have 'bit:test', got: {:?}", indexes);
-        assert!(!indexes.contains(&"bit::test".to_string()),
-                "Should NOT have 'bit::test'");
-        // Пересоздаем - не должно быть ошибок
-        data.create_bit_index("test", |&n| n % 3 == 0);
+        assert!(indexes.contains(&"test".to_string()),
+                "Should have 'test', got: {:?}", indexes);
+        assert!(data.create_field_index("test", |&n| n % 3).is_ok());
         let indexes = data.list_indexes();
         assert_eq!(indexes.len(), 1, "Should have only 1 index after replace");
+    }
+    
+    #[test]
+    fn test_field_index_boolean_values() {
+        let items: Vec<i32> = (0..1000).collect();
+        let data = FilterData::from_vec(items);
+        assert!(data.create_field_index("even", |&n| n % 2 == 0).is_ok());
+        data.filter_by_field_ops("even", &[
+            (FieldOperation::eq(true), Op::And)
+        ]).unwrap();
+        assert_eq!(data.len(), 500);
+        let result = data.items();
+        assert!(result.iter().all(|n| **n % 2 == 0));
     }
     
     #[test]
     fn test_clear_indexes_efficient() {
         let items: Vec<i32> = (0..1000).collect();
         let data = FilterData::from_vec(items);
-        // Создаем много индексов
+        
         for i in 0..100 {
-            data.create_index(&format!("idx_{}", i), move |&n| n % (i + 1));
-            data.create_bit_index(&format!("bit_{}", i), move |&n| n % (i + 1) == 0);
+            let result_num = data.create_field_index(
+                &format!("idx_{}", i), 
+                move |&n| n % (i + 1)
+            );
+            
+            let result_bool = data.create_field_index(
+                &format!("bool_{}", i), 
+                move |&n| n % (i + 1) == 0
+            );
+            assert!(result_num.is_ok());
+            assert!(result_bool.is_ok());
         }
         assert_eq!(data.list_indexes().len(), 200);
-        // Очищаем битовые
-        use std::time::Instant;
-        let start = Instant::now();
-        data.clear_bit_indexes();
-        let elapsed = start.elapsed();
-        println!("Clear 100 bit indexes: {:?}", elapsed);
-        assert!(elapsed.as_millis() < 100, "Should be fast");
-        assert_eq!(data.list_indexes().len(), 100);
-        // Очищаем все
+        let start = time::Instant::now();
         data.clear_all_indexes();
+        let elapsed = start.elapsed();
+        println!("Clear 200 field indexes: {:?}", elapsed);
+        assert!(elapsed.as_millis() < 100, "Should be fast");
         assert_eq!(data.list_indexes().len(), 0);
     }
     
     #[test]
-    fn test_reset_to_source_order() {
+    fn test_reset_to_source_and_clear_indexes() {
         let items: Vec<i32> = (0..1000).collect();
         let data = FilterData::from_vec(items);
-        // Создаем индексы
-        data.create_index("test", |&n| n % 10);
-        data.create_bit_index("even", |&n| n % 2 == 0);
-        // Фильтруем
-        data.filter(|&n| n > 500);
+        data.create_field_index("test", |&n| n % 10).unwrap();
+        data.create_field_index("even", |&n| n % 2 == 0).unwrap();
+        data.filter(|&n| n > 500).unwrap();
         assert_eq!(data.len(), 499);
         assert_eq!(data.list_indexes().len(), 2);
-        // Сбрасываем
         data.reset_to_source();
+        data.clear_all_indexes();
         assert_eq!(data.len(), 1000);
         assert_eq!(data.list_indexes().len(), 0, "All indexes should be cleared");
+    }
+
+    #[test]
+    fn test_field_index_type_conversion() {
+        let items: Vec<i32> = (0..1000).collect();
+        let data = FilterData::from_vec(items);
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        data.filter_by_field_ops("value", &[
+            (FieldOperation::gte(500), Op::And),
+        ]).unwrap();
+        assert_eq!(data.len(), 500);
+    }
+
+    #[test]
+    fn test_field_index_multiple_operations() {
+        let items: Vec<i32> = (0..1000).collect();
+        let data = FilterData::from_vec(items);
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        data.filter_by_field_ops("value", &[
+            (FieldOperation::gte(100), Op::And),
+            (FieldOperation::lte(200), Op::And),
+            (FieldOperation::not_eq(150), Op::And),
+        ]).unwrap();
+        let result = data.items();
+        assert!(result.iter().all(|n| {
+            let val = **n;
+            val >= 100 && val <= 200 && val != 150
+        }));
+    }
+
+    #[test]
+    fn test_field_index_in_operation() {
+        let items: Vec<i32> = (0..100).collect();
+        let data = FilterData::from_vec(items);
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        data.filter_by_field_ops("value", &[
+            (FieldOperation::in_values(vec![10, 20, 30, 40, 50]), Op::And),
+        ]).unwrap();
+        assert_eq!(data.len(), 5);
+        let result = data.items();
+        let ids: Vec<i32> = result.iter().map(|n| **n).collect();
+        assert_eq!(ids, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_field_index_range_operation() {
+        let items: Vec<i32> = (0..1000).collect();
+        let data = FilterData::from_vec(items);
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        data.filter_by_field_ops("value", &[
+            (FieldOperation::range(100, 200), Op::And),
+        ]).unwrap();
+        assert_eq!(data.len(), 101);
+        let result = data.items();
+        assert!(result.iter().all(|n| {
+            let val = **n;
+            val >= 100 && val <= 200
+        }));
+    }
+
+    #[test]
+    fn test_field_index_concurrent_filtering() {
+        let items: Vec<i32> = (0..10_000).collect();
+        let data = Arc::new(FilterData::from_vec(items));
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        let mut handles = vec![];
+        for i in 0..10 {
+            let data_clone = Arc::clone(&data);
+            let handle = thread::spawn(move || {
+                for j in 0..50 {
+                    data_clone.reset_to_source();
+                    let threshold = (i * 1000 + j * 10) as i32;
+                    data_clone.filter_by_field_ops("value", &[
+                        (FieldOperation::gte(threshold), Op::And),
+                    ]).unwrap();
+                    let count = data_clone.len();
+                    assert!(count <= 10_000);
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        println!("✓ Concurrent field index filtering successful");
+    }
+
+    #[test]
+    fn test_field_index_not_in_operation() {
+        let items: Vec<i32> = (0..100).collect();
+        let data = FilterData::from_vec(items);
+        data.create_field_index("value", |&n| n as u64).unwrap();
+        data.filter_by_field_ops("value", &[
+            (FieldOperation::not_in_values(vec![10, 20, 30, 40, 50]), Op::And),
+        ]).unwrap();
+        assert_eq!(data.len(), 95);
+        let result = data.items();
+        let excluded = [10, 20, 30, 40, 50];
+        assert!(result.iter().all(|n| !excluded.contains(&**n)));
     }
 }

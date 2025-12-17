@@ -1,41 +1,53 @@
 use super::{
-    bit_index::BitOp,
-    filter::FilterData
+    errors::{
+        GLobalError,
+        FilterDataError,
+    },
+    index::{
+        bit::Op,
+        field::{
+            IndexField,
+            IntoIndexFieldEnum,
+            FieldOperation,
+            FieldValue,
+        }
+    },
+    filter::FilterData,
+    result::GlobalResult,
 };
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
-    fmt::Debug,
-    collections::BTreeMap,
+    collections::{BTreeMap,btree_map}, 
+    fmt::{Debug, Display}, 
+    hash::Hash, 
+    ops::RangeBounds,
     sync::{
         Arc, 
         Weak
-    },
+    }
 };
 
 pub struct GroupData<K, V>
 where
-    K: Ord + Clone + Send + Sync,
-    V: Send + Sync,
+    K: Ord + Clone + Send + Sync + Display + Hash,
+    V: Send + Sync + 'static,
 {
     pub key: K,
     pub data: Arc<FilterData<V>>,
-    
     // Дерево - Weak ссылка на родителя (циклическая ссылка)
     parent: Option<Weak<GroupData<K, V>>>,
     subgroups: ArcSwap<BTreeMap<K, Arc<GroupData<K, V>>>>,
-    
     pub description: Option<Arc<str>>,
     depth: usize,
-    
     // Mutex только для group_by 
     write_lock: Mutex<()>,
 }
 
 impl<K, V> GroupData<K, V>
 where
-    K: Ord + Clone + Debug + Send + Sync + 'static,
+    K: Ord + Clone + Debug + Send + Sync + Display + Hash + 'static,
     V: Send + Sync + Clone + 'static,
 {
     // ========================================================================
@@ -61,14 +73,14 @@ where
         data: Vec<V>, 
         description: &str,
         index_builder: F,
-    ) -> Arc<Self>
+    ) -> GlobalResult<Arc<Self>>
     where
-        F: FnOnce(FilterData<V>) -> FilterData<V>,
+        F: FnOnce(FilterData<V>) -> GlobalResult<FilterData<V>>,
     {
         let filter_data = FilterData::from_vec(data);
-        let filter_data = index_builder(filter_data);
+        let filter_data = index_builder(filter_data)?;
         
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             key,
             data: Arc::new(filter_data),
             parent: None,
@@ -76,7 +88,7 @@ where
             description: Some(Arc::from(description)),
             depth: 0,
             write_lock: Mutex::new(()),
-        })
+        }))
     }
 
     fn new_child(
@@ -100,79 +112,12 @@ where
     // Grouping Methods 
 
     // group_by с автоматической сортировкой индексов
-    // 
-    //  Производительность:
-    // - Экономия памяти: ~30-70% (только индексы вместо Arc клонов)
-    // - Скорость группировки: +20-30% (меньше аллокаций)
-    // - Cache-friendly: данные остаются в одном месте
-    // - Сортировка индексов: +3-5% overhead, но 3x ускорение итераций
-    // 
-    // Индексы автоматически сортируются для cache-friendly доступа:
-    // - Sequential memory access вместо random
-    // - Cache hit rate: 80-90% вместо 30-40%
-    pub fn group_by<F>(self: &Arc<Self>, extractor: F, description: &str)
+    #[inline]
+    pub fn group_by<F>(self: &Arc<Self>, extractor: F, description: &str) -> GlobalResult<()>
     where
         F: Fn(&V) -> K + Sync + Send,
     {
-        let description_arc: Arc<str> = Arc::from(description);
-        let parent_data = match self.data.parent_data() {
-            Some(data) => data,
-            None => {
-                eprintln!("WARNING: parent_data is None in group_by");
-                return;
-            }
-        };
-        let current_indices = self.data.current_indices();
-        // Параллельная группировка
-        let grouped: BTreeMap<K, Vec<usize>> = current_indices
-            .par_iter()
-            .fold(
-                || BTreeMap::new(),
-                |mut acc, &idx| {
-                    let item = &parent_data[idx];
-                    let key = extractor(item);
-                    acc.entry(key)
-                        .or_insert_with(|| Vec::with_capacity(64))
-                        .push(idx);
-                    acc
-                },
-            )
-            .reduce(
-                || BTreeMap::new(),
-                |mut acc, map| {
-                    for (key, mut indices) in map {
-                        match acc.entry(key) {
-                            std::collections::btree_map::Entry::Vacant(e) => {
-                                e.insert(indices);
-                            }
-                            std::collections::btree_map::Entry::Occupied(mut e) => {
-                                e.get_mut().append(&mut indices);
-                            }
-                        }
-                    }
-                    acc
-                },
-            );
-        let new_depth = self.depth + 1;
-        // ПАРАЛЛЕЛЬНАЯ сортировка и создание subgroups!
-        let new_subgroups: BTreeMap<K, Arc<GroupData<K, V>>> = grouped
-            .into_par_iter()  // ← Параллельно!
-            .map(|(key, mut indices)| {
-                // Каждый thread сортирует свою группу
-                indices.sort_unstable();
-                let filter_data = FilterData::from_indices(&parent_data, indices);
-                let child = Self::new_child(
-                    key.clone(),
-                    Arc::new(filter_data),
-                    self,
-                    Arc::clone(&description_arc),
-                    new_depth,
-                );
-                (key, child)
-            })
-            .collect();  // BTreeMap::from_par_iter
-        let _guard = self.write_lock.lock();
-        self.subgroups.store(Arc::new(new_subgroups));
+        self.group_by_with_indexes(extractor, description, |_| Ok(()))
     }
     
     
@@ -183,22 +128,22 @@ where
     // - Нужны индексы сразу после группировки
     // - Подгруппы будут активно фильтроваться
     // - Требуется быстрый доступ по ключам
+    #[inline]
     pub fn group_by_with_indexes<F, IF>(
         self: &Arc<Self>, 
         extractor: F, 
         description: &str,
         index_creator: IF,
-    )
+    ) -> GlobalResult<()>
     where
         F: Fn(&V) -> K + Sync + Send,
-        IF: Fn(&FilterData<V>) + Sync + Send,
+        IF: Fn(&FilterData<V>) -> GlobalResult<()> + Sync + Send,
     {
         let description_arc: Arc<str> = Arc::from(description);
         let parent_data = match self.data.parent_data() {
             Some(data) => data,
             None => {
-                eprintln!("WARNING: parent_data is None in group_by_with_indexes");
-                return;
+                return Err(GLobalError::ParentDataIsEmpty)
             }
         };
         let current_indices = self.data.current_indices();
@@ -221,10 +166,10 @@ where
                 |mut acc, map| {
                     for (key, mut indices) in map {
                         match acc.entry(key) {
-                            std::collections::btree_map::Entry::Vacant(e) => {
+                            btree_map::Entry::Vacant(e) => {
                                 e.insert(indices);
                             }
-                            std::collections::btree_map::Entry::Occupied(mut e) => {
+                            btree_map::Entry::Occupied(mut e) => {
                                 e.get_mut().append(&mut indices);
                             }
                         }
@@ -234,7 +179,7 @@ where
             );
         let new_depth = self.depth + 1;
         // Параллельное создание подгрупп с индексами
-        let new_subgroups: BTreeMap<K, Arc<GroupData<K, V>>> = grouped
+        let result_new_subgroups: GlobalResult<BTreeMap<K, Arc<GroupData<K, V>>>> = grouped
             .into_par_iter()
             .map(|(key, mut indices)| {
                 //  СОРТИРУЕМ индексы для cache-friendly доступа!
@@ -245,7 +190,7 @@ where
                 );
                 // Создаём индексы
                 // ВАЖНО: Индексы будут хранить Arc<V>, увеличивая ref count!
-                index_creator(&filter_data);
+                index_creator(&filter_data)?;
                 let child = Self::new_child(
                     key.clone(),
                     Arc::new(filter_data),
@@ -253,113 +198,99 @@ where
                     Arc::clone(&description_arc),
                     new_depth,
                 );
-                (key, child)
+                Ok((key, child))
             })
             .collect();
+
+        let new_subgroups = result_new_subgroups?;
         let _guard = self.write_lock.lock();
         self.subgroups.store(Arc::new(new_subgroups));
+        Ok(())
     }
 
     // Index Methods
     
     // Создать индекс в текущей группе
-    pub fn create_index<IK, F>(&self, name: &str, extractor: F) -> &Self
+    pub fn create_field_index<IK, F>(&self, name: &str, extractor: F) -> GlobalResult<&Self> 
     where
-        IK: Ord + Clone + Send + Sync + 'static,
+        IK: Ord + Hash + Clone + Send + Sync + Display + 'static,
+        IK: Into<FieldValue>,
         F: Fn(&V) -> IK + Send + Sync + 'static + Clone,
+        IndexField<IK>: IntoIndexFieldEnum,
     {
-        self.data.create_index(name, extractor);
-        self
+        self.data.create_field_index(name, extractor)?;
+        Ok(self)
     }
     
     // Создать индекс во всех подгруппах
-    pub fn create_index_in_subgroups<IK, F>(&self, name: &str, extractor: F)
+    pub fn create_field_index_in_subgroups<IK, F>(&self, name: &str, extractor: F) -> GlobalResult<()>
     where
-        IK: Ord + Clone + Send + Sync + 'static,
+        IK: Ord + Hash + Clone + Send + Sync + Display + 'static,
+        IK: Into<FieldValue>,
         F: Fn(&V) -> IK + Send + Sync + 'static + Clone,
+        IndexField<IK>: IntoIndexFieldEnum,
     {
-        let subgroups_vec = self.get_all_subgroups();
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.data.create_index(name, extractor.clone());
-        });
+        self.with_all_subgroups(|subgroups| {
+            subgroups.par_iter().try_for_each(|subgroup| {
+                subgroup.data.create_field_index(name, extractor.clone())
+                .map(|_| ())
+                .map_err(|err| err)
+            })
+        })
     }
-    
+
     // Создать индекс рекурсивно во всём дереве
-    pub fn create_index_recursive<IK, F>(self: &Arc<Self>, name: &str, extractor: F)
+    pub fn create_field_index_recursive<IK, F>(self: &Arc<Self>, name: &str, extractor: F) -> GlobalResult<()>
     where
-        IK: Ord + Clone + Send + Sync + 'static,
+        IK: Ord + Hash + Clone + Send + Sync + Display + 'static,
+        IK: Into<FieldValue>,
         F: Fn(&V) -> IK + Send + Sync + 'static + Clone,
+        IndexField<IK>: IntoIndexFieldEnum,
     {
-        self.data.create_index(name, extractor.clone());
+        self.data.create_field_index(name, extractor.clone())?;
         let subgroups_vec = self.get_all_subgroups();
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.create_index_recursive(name, extractor.clone());
-        });
+        subgroups_vec.par_iter().try_for_each(|subgroup: &Arc<GroupData<K, V>>| {
+            subgroup.create_field_index_recursive(name, extractor.clone())
+            .map(|_|())
+            .map_err(|err| err)
+        })
     }
     
     // Фильтрация через индекс (read-only)
-    pub fn filter_by_index<IK>(&self, index_name: &str, key: &IK) -> Vec<Arc<V>>
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
+    pub fn filter_by_field_ops(&self, name: &str, operations: &[(FieldOperation, Op)]) -> GlobalResult<Arc<Vec<Arc<V>>>>
     {
-        self.data.filter_by_index(index_name, key)
-    }
-    
-    // Range query через индекс (read-only)
-    pub fn filter_by_index_range<IK, R>(&self, index_name: &str, range: R) -> Vec<Arc<V>>
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-        R: std::ops::RangeBounds<IK>,
-    {
-        self.data.filter_by_index_range(index_name, range)
-    }
-    
-    // Получить отсортированные элементы по индексу
-    pub fn get_sorted_by_index<IK>(&self, index_name: &str) -> Vec<Arc<V>>
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-    {
-        self.data.get_sorted_by_index::<IK>(index_name)
-    }
-    
-    // Получить топ N по индексу
-    pub fn get_top_n_by_index<IK>(&self, index_name: &str, n: usize) -> Vec<Arc<V>>
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-    {
-        self.data.get_top_n_by_index::<IK>(index_name, n)
+        Ok(self.data.filter_by_field_ops(name, operations)?.items())
     }
 
-    // Создать битовый индекс в текущей группе
-    pub fn create_bit_index<F>(&self, name: &str, predicate: F) -> &Self
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static + Clone,
+    pub fn filter_by_fields_ops(&self, fields: &[(&str, &[(FieldOperation, Op)])]) -> GlobalResult<Arc<Vec<Arc<V>>>>
     {
-        self.data.create_bit_index(name, predicate);
-        self
-    }
-    
-    // Создать битовые индексы во всех подгруппах
-    pub fn create_bit_index_in_subgroups<F>(&self, name: &str, predicate: F)
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static + Clone,
-    {
-        let subgroups_vec = self.get_all_subgroups();
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.data.create_bit_index(name, predicate.clone());
-        });
-    }
-    
-    // Фильтрация через битовые операции
-    pub fn filter_by_bit_operation(&self, operations: &[(&str, BitOp)]) -> Vec<Arc<V>> {
-        self.data.bit_operation(operations).apply_to_fast(&self.data.items())
-    }
-    
-    // Применить битовую операцию как фильтр
-    pub fn apply_bit_operation(&self, operations: &[(&str, BitOp)]) {
-        self.data.apply_bit_operation(operations);
+        Ok(self.data.filter_by_fields_ops(fields)?.items())
     }
 
+    pub fn create_text_index<F>(
+        &self,
+        name: &str,
+        extractor: F
+    ) -> GlobalResult<()>
+    where F: Fn(&V) -> String + Send + Sync + 'static + Clone,
+    {
+        let _ = self.data.create_text_index(name, extractor)?;
+        Ok(())
+    }
+
+    pub fn search_with_text(&self,name:&str, query: &str) -> GlobalResult<Arc<Vec<Arc<V>>>>{
+        Ok(self.data.search_with_text(name, query)?.items())
+    }
+
+    pub fn search_complex_words_text(
+        &self,
+        name: &str,
+        or_words: &[&str],
+        and_words: &[&str],
+        not_words: &[&str],
+    ) -> GlobalResult<Arc<Vec<Arc<V>>>>{
+        Ok(self.data.search_complex_words_text(name, or_words, and_words, not_words)?.items())
+    }
 
     // Validation Methods
     
@@ -384,12 +315,46 @@ where
         self.data.is_valid()
     }
 
+    
+
 
     // Navigation Methods
 
-    // Переход к родителю (с полной очисткой состояния)
-    // 
-    //  Очищает:
+    // Очищаем пути детей
+    fn clean_path_to_target(path: &[Arc<Self>]) {
+        // Очищаем все узлы кроме последнего
+        if path.len() > 1 {
+            for node in &path[..path.len() - 1] {
+                node.clear_subgroups();
+                node.reset_filters();
+                node.clear_all_indexes();
+            }
+        }
+        // Очищаем целевой узел
+        if let Some(target) = path.last() {
+            target.clear_subgroups();
+            target.reset_filters();
+            target.clear_all_indexes();
+        }
+    }
+
+    // Получаем список всех родителей к корню
+    pub fn get_parents(&self) -> Vec<Arc<Self>> {
+        let mut parents = Vec::new();
+        let mut current_weak = self.parent.clone();
+        while let Some(parent_weak) = current_weak {
+            if let Some(parent) = parent_weak.upgrade() {
+                parents.push(Arc::clone(&parent));
+                current_weak = parent.parent.clone();
+            } else {
+                break;
+            }
+        }
+        parents
+    }
+
+    // Переход к родителю (с полной очисткой состояния) 
+    // Очищает:
     // - Все подгруппы (рекурсивно)
     // - Все фильтры (сброс к source)
     // - Все индексы
@@ -403,6 +368,45 @@ where
                 // Очищаем все индексы родителя
                 parent.clear_all_indexes();
                 return Some(parent);
+            }
+        }
+        None
+    }
+
+    // Переход к указаному родителю (с полной очисткой состояния) 
+    // Очищает:
+    // - Все подгруппы (рекурсивно)
+    // - Все фильтры (сброс к source)
+    // - Все индексы
+    pub fn go_to_parent_current(&self, key: &K) -> Option<Arc<Self>> {
+        let mut path = Vec::new();
+        let mut current_weak = self.parent.clone();
+        while let Some(parent_weak) = current_weak {
+            if let Some(parent) = parent_weak.upgrade(){
+                path.push(Arc::clone(&parent));
+                if &parent.key == key {
+                    Self::clean_path_to_target(&path);
+                    return path.last().cloned()
+                }
+                current_weak = parent.parent.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Найти родителя по ключу (без очистки, read-only)
+    pub fn find_parent(&self, key: &K) -> Option<Arc<Self>> {
+        let mut current_weak = self.parent.clone();
+        while let Some(parent_weak) = current_weak {
+            if let Some(parent) = parent_weak.upgrade() {
+                if &parent.key == key {
+                    return Some(parent);
+                }
+                current_weak = parent.parent.clone();
+            } else {
+                break;
             }
         }
         None
@@ -542,7 +546,7 @@ where
     // Получить подгруппы в диапазоне ключей
     pub fn get_subgroups_range<R>(&self, range: R) -> Vec<Arc<GroupData<K, V>>>
     where
-        R: std::ops::RangeBounds<K>,
+        R: RangeBounds<K>,
     {
         self.subgroups.load()
             .range(range)
@@ -584,6 +588,16 @@ where
         self.subgroups.load().values().cloned().collect()
     }
 
+    // Версия БЕЗ клонирования Arc (callback pattern)
+    pub fn with_all_subgroups<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[Arc<GroupData<K, V>>]) -> R,
+    {
+        let subgroups = self.subgroups.load();
+        let vec: Vec<_> = subgroups.values().cloned().collect();
+        f(&vec)
+    }
+
     // Очистить все подгруппы рекурсивно
     pub fn clear_subgroups(&self) {
         let current_subgroups = self.subgroups.load();
@@ -600,14 +614,14 @@ where
         self.data.clear_all_indexes();
     }
 
-    // Очистить только битовые индексы
-    pub fn clear_bit_indexes(&self) {
-        self.data.clear_bit_indexes();
+    // Очистить только field индексы
+    pub fn clear_field_indexes(&self) {
+        self.data.clear_filed_index();
     }
 
-    // Очистить только обычные индексы (не битовые)
-    pub fn clear_regular_indexes(&self) {
-        self.data.clear_regular_indexes();
+    // Очистить только text индексы
+    pub fn clear_text_indexes(&self) {
+        self.data.clear_text_indexes();
     }
 
 
@@ -628,26 +642,22 @@ where
     where
         F: Fn(&Arc<GroupData<K, V>>) + Sync + Send,
     {
-        callback(self);
-        let subgroups_vec: Vec<_> = self.subgroups.load().values().cloned().collect();
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.traverse_parallel(callback);
-        });
+        let all_nodes = self.collect_all_groups();
+        all_nodes.par_iter().for_each(|node| {
+            callback(node);
+        }); 
     }
 
     // Собрать все группы рекурсивно
     pub fn collect_all_groups(self: &Arc<Self>) -> Vec<Arc<GroupData<K, V>>> {
         let mut result = Vec::new();
-        self.collect_recursive(&mut result);
-        result
-    }
-
-    fn collect_recursive(self: &Arc<Self>, result: &mut Vec<Arc<GroupData<K, V>>>) {
-        result.push(Arc::clone(self));
-        
-        for subgroup in self.get_all_subgroups() {
-            subgroup.collect_recursive(result);
+        let mut stack = vec![Arc::clone(self)];
+        while let Some(node) = stack.pop() {
+            result.push(Arc::clone(&node));
+            let subgroups = node.subgroups.load();
+            stack.extend(subgroups.values().cloned());
         }
+        result
     }
 
     // Statistics
@@ -682,28 +692,11 @@ where
     // Filtering
 
     // Фильтрация данных в текущей группе
-    pub fn filter<F>(&self, predicate: F)
+    pub fn filter<F>(&self, predicate: F) -> GlobalResult<Arc<Vec<Arc<V>>>>
     where
         F: Fn(&V) -> bool + Sync + Send,
     {
-        self.data.filter(predicate);
-    }
-    
-    // Применить индексный фильтр как новый уровень
-    pub fn apply_index_filter<IK>(&self, index_name: &str, key: &IK)
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-    {
-        self.data.apply_index_filter(index_name, key);
-    }
-    
-    // Применить range-фильтр как новый уровень
-    pub fn apply_index_range<IK, R>(&self, index_name: &str, range: R)
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-        R: std::ops::RangeBounds<IK> + Clone,
-    {
-        self.data.apply_index_range(index_name, range);
+        Ok(self.data.filter(predicate)?.items())
     }
 
     // Сброс фильтров к исходным данным
@@ -712,25 +705,42 @@ where
     }
 
     // Фильтрация всех подгрупп
-    pub fn filter_subgroups<F>(&self, predicate: F)
+    pub fn filter_subgroups<F>(&self, predicate: F) -> GlobalResult<BTreeMap<K,Arc<Vec<Arc<V>>>>>
     where
         F: Fn(&V) -> bool + Sync + Send + Clone,
-    {
-        let subgroups_vec = self.get_all_subgroups();    
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.filter(predicate.clone());
-        });
-    }
-    
-    // Применить индексный фильтр ко всем подгруппам
-    pub fn apply_index_filter_to_subgroups<IK>(&self, index_name: &str, key: &IK)
-    where
-        IK: Ord + Clone + Send + Sync + 'static,
-    {
-        let subgroups_vec = self.get_all_subgroups();
-        subgroups_vec.par_iter().for_each(|subgroup| {
-            subgroup.data.apply_index_filter(index_name, key);
-        });
+    {   
+        let subgroups = self.subgroups.load();
+        if subgroups.len() < 8 {
+            // Последовательно
+            let mut results = BTreeMap::new();
+            for (key, subgroup) in subgroups.iter() {
+                let items = match subgroup.filter(predicate.clone()) {
+                    Ok(items) => items,
+                    Err(GLobalError::FilterData(FilterDataError::DataNotFound)) => {
+                        Arc::new(Vec::new())
+                    }
+                    Err(err) => return Err(err),
+                };
+                results.insert(key.clone(), items);
+            }
+            return Ok(results);
+        }
+        
+        // Параллельно
+        let results: Result<BTreeMap<K, Arc<Vec<Arc<V>>>>, GLobalError> = subgroups
+            .par_iter()
+            .map(|(key, subgroup)| {
+                let items = match subgroup.filter(predicate.clone()) {
+                    Ok(items) => items,
+                    Err(GLobalError::FilterData(FilterDataError::DataNotFound)) => {
+                        Arc::new(Vec::new())
+                    }
+                    Err(err) => return Err(err),
+                };
+                Ok((key.clone(), items))
+            })
+            .collect();
+        results
     }
 
     // Display/Debug
@@ -777,58 +787,80 @@ where
 pub struct FilterGroup;
 
 impl FilterGroup {
-    pub fn filter_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>)
+    pub fn filter_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>) -> GlobalResult<()>
     where
-        K: Ord + Clone + Debug + Send + Sync + 'static,
+        K: Ord + Clone + Debug + Send + Sync + Display + Hash + 'static,
         V: Send + Sync + Clone + 'static,
         F: Fn(&V) -> bool + Send + Sync,
     {   
-        groups_and_filters.into_par_iter().for_each(|(group, filter)| {
-            group.filter(filter);
-        });
+        groups_and_filters.into_par_iter().try_for_each(|(group, filter)| {
+            group.filter(filter)?;
+            Ok(())
+        })
     }
 
-    pub fn filter_subgroups_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>)
+    pub fn filter_subgroups_parallel<K, V, F>(groups_and_filters: Vec<(Arc<GroupData<K, V>>, F)>) -> GlobalResult<()>
     where
-        K: Ord + Clone + Debug + Send + Sync + 'static,
+        K: Ord + Clone + Debug + Send + Sync + Display + Hash + 'static,
         V: Send + Sync + Clone + 'static,
         F: Fn(&V) -> bool + Send + Sync + Clone,
     {
-        groups_and_filters.into_par_iter().for_each(|(group, filter)| {
-            group.filter_subgroups(filter);
-        });
+        groups_and_filters.into_par_iter().try_for_each(|(group, filter)| {
+            group.filter_subgroups(filter)?;
+            Ok(())
+        })
     }
     
     // Создать индексы во всех группах параллельно
-    pub fn create_indexes_parallel<K, V, IK, F>(
+    pub fn create_field_indexes_parallel<K, V, IK, F>(
         groups: Vec<Arc<GroupData<K, V>>>,
         index_name: &str,
         extractor: F,
-    )
+    ) -> GlobalResult<()>
     where
-        K: Ord + Clone + Debug + Send + Sync + 'static,
+        K: Ord + Clone + Debug + Send + Sync + Display + Hash + 'static,
         V: Send + Sync + Clone + 'static,
-        IK: Ord + Clone + Send + Sync + 'static,
+        IK: Ord + Hash + Clone + Send + Sync + Display + 'static,
+        IK: Into<FieldValue>,
         F: Fn(&V) -> IK + Send + Sync + Clone + 'static,
+        IndexField<IK>: IntoIndexFieldEnum,
     {
         let name = index_name.to_string();
-        groups.into_par_iter().for_each(|group| {
-            group.data.create_index(&name, extractor.clone());
-        });
+        groups.into_par_iter().try_for_each(|group| {
+            group.data.create_field_index(&name, extractor.clone())
+            .map(|_| ())
+            .map_err(|err| err)
+        })
     }
 }
 
 #[macro_export]
 macro_rules! group_filter_parallel {
     ( $( $group:expr => $filter:expr ),+ $(,)? ) => {
-        {
+        {   
+            use parking_lot::Mutex;
+            use std::sync::Arc;
+
+            let results = Arc::new(Mutex::new(Vec::new()));
             rayon::scope(|s| {
                 $(
-                    s.spawn(|_| {
-                        $group.filter($filter);
-                    });
+                    {
+                        let results = Arc::clone(&results);
+                        let group = Arc::clone(&$group);
+                        s.spawn(move |_| {
+                            let result = group.filter($filter);
+                            results.lock().push(result);
+                        });
+                    }
                 )+
             });
+            let results = Arc::try_unwrap(results)
+                .unwrap()
+                .into_inner();
+            
+            results.into_iter()
+                .find_map(|r| r.err())
+                .map_or(Ok(()), Err)
         }
     };
 }
@@ -837,13 +869,28 @@ macro_rules! group_filter_parallel {
 macro_rules! group_filter_subgroups_parallel {
     ( $( $group:expr => $filter:expr ),+ $(,)? ) => {
         {
+            use parking_lot::Mutex;
+
+            let results = Arc::new(Mutex::new(Vec::new()));
             rayon::scope(|s| {
                 $(
-                    s.spawn(|_| {
-                        $group.filter_subgroups($filter);
-                    });
+                    {
+                        let results = Arc::clone(&results);
+                        let group = Arc::clone(&$group);
+                        s.spawn(move |_| {
+                            let result = group.filter_subgroups($filter);
+                            results.lock().push(result);
+                        });
+                    }
                 )+
             });
+            let results = Arc::try_unwrap(results)
+                .unwrap()
+                .into_inner();
+            
+            results.into_iter()
+                .find_map(|r| r.err())
+                .map_or(Ok(()), Err)
         }
     };
 }

@@ -1,8 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use tree_man::{
+    Op,
+    FieldOperation,
+    OrderedFloat,
     group_filter_parallel,
     group::GroupData,
-    bit_index::BitOp,
 };
 use std::hint::black_box;
 
@@ -58,7 +60,7 @@ fn bench_group_by(c: &mut Criterion) {
             let root = GroupData::new_root("Root".to_string(), products, "All");
             b.iter(|| {
                 root.clear_subgroups();
-                root.group_by(|p| black_box(p.category.clone()), "Categories");
+                root.group_by(|p| black_box(p.category.clone()), "Categories").unwrap();
             });
         });
     }
@@ -68,7 +70,7 @@ fn bench_group_by(c: &mut Criterion) {
 fn bench_get_subgroup(c: &mut Criterion) {
     let products = create_products(100);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.category.clone(), "Categories");
+    root.group_by(|p| p.category.clone(), "Categories").unwrap();
     c.bench_function("get_subgroup", |b| {
         b.iter(|| {
             black_box(root.get_subgroup(&"Phones".to_string()));
@@ -85,7 +87,7 @@ fn bench_filter(c: &mut Criterion) {
             let root = GroupData::new_root("Root".to_string(), products, "All");
             b.iter(|| {
                 root.reset_filters();
-                root.filter(|p| black_box(p.price > 700.0));
+                root.filter(|p| black_box(p.price > 100.0)).unwrap();
             });
         });
     }
@@ -97,7 +99,7 @@ fn bench_clear_subgroups(c: &mut Criterion) {
     let root = GroupData::new_root("Root".to_string(), products, "All");
     c.bench_function("clear_subgroups", |b| {
         b.iter(|| {
-            root.group_by(|p| p.category.clone(), "Categories");
+            root.group_by(|p| p.category.clone(), "Categories").unwrap();
             black_box(root.clear_subgroups());
         });
     });
@@ -106,9 +108,9 @@ fn bench_clear_subgroups(c: &mut Criterion) {
 fn bench_collect_all_groups(c: &mut Criterion) {
     let products = create_products(100);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.category.clone(), "Categories");
+    root.group_by(|p| p.category.clone(), "Categories").unwrap();
     let phones = root.get_subgroup(&"Phones".to_string()).unwrap();
-    phones.group_by(|p| p.brand.clone(), "Brands");
+    phones.group_by(|p| p.brand.clone(), "Brands").unwrap();
     c.bench_function("collect_all_groups", |b| {
         b.iter(|| {
             black_box(root.collect_all_groups());
@@ -118,8 +120,8 @@ fn bench_collect_all_groups(c: &mut Criterion) {
 
 // INDEX CREATION BENCHMARKS
 
-fn bench_create_single_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("create_single_index");
+fn bench_create_single_field_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("create_single_field_index");
     for size in [100, 1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -127,24 +129,24 @@ fn bench_create_single_index(c: &mut Criterion) {
             let root = GroupData::new_root("Root".to_string(), products, "All");
             
             b.iter(|| {
-                root.create_index("id", |p: &Product| black_box(p.id));
+                root.create_field_index("id", |p: &Product| black_box(p.id)).unwrap();
             });
         });
     }
     group.finish();
 }
 
-fn bench_create_multiple_indexes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("create_multiple_indexes");
+fn bench_create_multiple_field_indexes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("create_multiple_field_indexes");
     for size in [100, 1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let products = create_products(size);
             b.iter(|| {
                 let root = GroupData::new_root("Root".to_string(), products.clone(), "All");
-                root.create_index("id", |p: &Product| p.id)
-                    .create_index("category", |p: &Product| p.category.clone())
-                    .create_index("price", |p: &Product| (p.price * 100.0) as i64);
+                root.create_field_index("id", |p: &Product| p.id).unwrap();
+                root.create_field_index("category", |p: &Product| p.category.clone()).unwrap();
+                root.create_field_index("price", |p: &Product| (p.price * 100.0) as i64).unwrap();
                 black_box(root);
             });
         });
@@ -152,8 +154,8 @@ fn bench_create_multiple_indexes(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_create_bit_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("create_bit_index");
+fn bench_create_field_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("create_field_index");
     for size in [100, 1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -161,15 +163,15 @@ fn bench_create_bit_index(c: &mut Criterion) {
             let root = GroupData::new_root("Root".to_string(), products, "All");
             
             b.iter(|| {
-                root.create_bit_index("is_available", |p: &Product| black_box(p.is_available));
+                root.create_field_index("is_available", |p: &Product| black_box(p.is_available)).unwrap();
             });
         });
     }
     group.finish();
 }
 
-fn bench_group_creation_with_indexes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("group_creation_with_indexes");
+fn bench_group_creation_with_field_indexes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_creation_with_field_indexes");
     for size in [100, 1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -180,12 +182,12 @@ fn bench_group_creation_with_indexes(c: &mut Criterion) {
                     black_box(products.clone()),
                     "All",
                     |fd| {
-                        fd.create_index("id", |p: &Product| p.id)
-                            .create_index("price", |p: &Product| (p.price * 100.0) as i64)
-                            .create_bit_index("is_available", |p: &Product| p.is_available);
-                        fd
+                        fd.create_field_index("id", |p: &Product| p.id).unwrap();
+                        fd.create_field_index("price", |p: &Product| (p.price * 100.0) as i64).unwrap();
+                        fd.create_field_index("is_available", |p: &Product| p.is_available).unwrap();
+                        Ok(fd)
                     },
-                );
+                ).unwrap();
                 black_box(root);
             });
         });
@@ -193,118 +195,32 @@ fn bench_group_creation_with_indexes(c: &mut Criterion) {
     group.finish();
 }
 
+// INDEX BENCHMARKS
 
-// INDEX SEARCH BENCHMARKS
-
-fn bench_filter_by_index_vs_normal(c: &mut Criterion) {
-    let mut group = c.benchmark_group("filter_by_index_vs_normal");
-    for size in [1000, 10000, 100000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        let products = create_products(*size);
-        let root = GroupData::new_root("Root".to_string(), products, "All");
-        root.create_index("category", |p: &Product| p.category.clone());
-        // Normal filter
-        group.bench_with_input(
-            BenchmarkId::new("normal_filter", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    let result: Vec<_> = root.data.items()
-                        .iter()
-                        .filter(|p| p.category == "Phones")
-                        .cloned()
-                        .collect();
-                    black_box(result);
-                });
-            }
-        );
-        // Index filter
-        group.bench_with_input(
-            BenchmarkId::new("index_filter", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    let result = root.filter_by_index("category", &"Phones".to_string());
-                    black_box(result);
-                });
-            }
-        );
-    }
-    
-    group.finish();
-}
-
-fn bench_filter_by_index_range(c: &mut Criterion) {
-    let mut group = c.benchmark_group("filter_by_index_range");
+fn bench_field_index_operation_and(c: &mut Criterion) {
+    let mut group = c.benchmark_group("field_index_operation_and");
     for size in [1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let products = create_products(size);
             let root = GroupData::new_root("Root".to_string(), products, "All");
-            root.create_index("id", |p: &Product| p.id);
-            let range_start = (size / 4) as u32;
-            let range_end = (size / 2) as u32;
+            root.create_field_index("is_avaible", |p: &Product| p.is_available).unwrap();
+            root.create_field_index("in_stock", |p: &Product| p.stock).unwrap();
             b.iter(|| {
-                let result = root.filter_by_index_range("id", black_box(range_start)..black_box(range_end));
-                black_box(result);
-            });
-        });
-    }
-    group.finish();
-}
-
-fn bench_get_sorted_by_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_sorted_by_index");
-    for size in [100, 1000, 10000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            let products = create_products(size);
-            let root = GroupData::new_root("Root".to_string(), products, "All");
-            root.create_index("price", |p: &Product| (p.price * 100.0) as i64);
-            
-            b.iter(|| {
-                let result = root.get_sorted_by_index::<i64>("price");
-                black_box(result);
-            });
-        });
-    }
-    group.finish();
-}
-
-fn bench_get_top_n_by_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_top_n_by_index");
-    let products = create_products(100000);
-    let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.create_index("price", |p: &Product| (p.price * 100.0) as i64);
-    for n in [10, 100, 1000].iter() {
-        group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, &n| {
-            b.iter(|| {
-                let result = root.get_top_n_by_index::<i64>("price", black_box(n));
-                black_box(result);
-            });
-        });
-    }
-    group.finish();
-}
-
-
-// BIT INDEX BENCHMARKS
-
-fn bench_bit_operation_and(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bit_operation_and");
-    for size in [1000, 10000, 100000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            let products = create_products(size);
-            let root = GroupData::new_root("Root".to_string(), products, "All");
-            root.create_bit_index("is_available", |p: &Product| p.is_available)
-                .create_bit_index("in_stock", |p: &Product| p.stock > 10);
-            b.iter(|| {
-                let result = root.filter_by_bit_operation(&[
-                    ("is_available", BitOp::And),
-                    ("in_stock", BitOp::And),
-                ]);
-                black_box(result);
+                root.reset_filters();
+                let result = root.filter_by_fields_ops(
+                    &[
+                        (
+                            "is_avaible",
+                            &[(FieldOperation::eq(true),Op::And)]
+                        ),
+                        (
+                            "in_stock",
+                            &[(FieldOperation::gt(10),Op::And)]
+                        )
+                    ]
+                ).unwrap();
+                black_box(result.len());
             });
         });
     }
@@ -312,40 +228,45 @@ fn bench_bit_operation_and(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_bit_operation_vs_normal_filter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bit_operation_vs_normal_filter");
-    for size in [1000, 10000, 100000].iter() {
+fn bench_field_index_operation_vs_normal_filter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("field_index_operation_vs_normal_filter");
+    for size in [1_000_000,2_000_000,3_000_000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         let products = create_products(*size);
         let root = GroupData::new_root("Root".to_string(), products, "All");
-        root.create_bit_index("is_available", |p: &Product| p.is_available)
-            .create_bit_index("in_stock", |p: &Product| p.stock > 10);
+        root.create_field_index("is_available", |p: &Product| p.is_available).unwrap();
+        root.create_field_index("in_stock", |p: &Product| p.stock).unwrap();
         // Normal filter
         group.bench_with_input(
             BenchmarkId::new("normal_filter", size),
             size,
             |b, _| {
                 b.iter(|| {
-                    let result: Vec<_> = root.data.items()
-                        .iter()
-                        .filter(|p| p.is_available && p.stock > 10)
-                        .cloned()
-                        .collect();
-                    black_box(result);
+                    root.data.reset_to_source();
+                    root.filter(|p| p.is_available && p.stock > 10).unwrap();
+                    black_box(root.data.items().len());
                 });
             }
         );
         // Bit operation
         group.bench_with_input(
-            BenchmarkId::new("bit_operation", size),
+            BenchmarkId::new("field_index_operation", size),
             size,
             |b, _| {
                 b.iter(|| {
-                    let result = root.filter_by_bit_operation(&[
-                        ("is_available", BitOp::And),
-                        ("in_stock", BitOp::And),
-                    ]);
-                    black_box(result);
+                    root.reset_filters();
+                    root.data.filter_by_fields_ops(&[
+                        (
+                            "is_available",
+                            &[(FieldOperation::eq(true),Op::And)],
+                        ),
+                        (
+                            "in_stock",
+                            &[(FieldOperation::gt(10),Op::And)]
+                        )
+                        ]
+                    ).unwrap();
+                    black_box(root.data.items().len());
                 });
             }
         );
@@ -353,22 +274,36 @@ fn bench_bit_operation_vs_normal_filter(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_complex_bit_operations(c: &mut Criterion) {
+fn bench_complex_field_index_operations(c: &mut Criterion) {
     let products = create_products(100000);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.create_bit_index("is_available", |p: &Product| p.is_available)
-        .create_bit_index("in_stock", |p: &Product| p.stock > 10)
-        .create_bit_index("expensive", |p: &Product| p.price > 800.0)
-        .create_bit_index("cheap", |p: &Product| p.price < 600.0);
-    c.bench_function("complex_bit_operations", |b| {
+    root.create_field_index("is_available", |p: &Product| p.is_available).unwrap();
+    //.create_bit_index("in_stock", |p: &Product| p.stock > 10)
+    root.create_field_index("in_stock", |p: &Product| p.stock).unwrap();
+    //root.create_field_index("expensive", |p: &Product| p.price > 800.0)
+    root.create_field_index("expensive", |p| OrderedFloat(p.price)).unwrap();
+       // .create_bit_index("cheap", |p: &Product| p.price < 600.0);
+    c.bench_function("complex_field_index_operations", |b| {
         b.iter(|| {
-            // (available AND in_stock) OR (expensive AND NOT cheap)
-            let result1 = root.filter_by_bit_operation(&[
-                ("is_available", BitOp::And),
-                ("in_stock", BitOp::And),
-                ("expensive", BitOp::Or),
-            ]);
-            black_box(result1);
+            root.reset_filters();
+            let result = root.filter_by_fields_ops
+            (
+                &[
+                    (
+                        "is_available",
+                        &[(FieldOperation::eq(true),Op::And)],
+                    ),
+                    (
+                        "in_stock",
+                        &[(FieldOperation::gt(10),Op::And)],
+                    ),
+                    (
+                        "expensive",
+                        &[(FieldOperation::gt(800.0),Op::Or)]
+                    )
+                ]
+            ).unwrap();
+            black_box(result.len());
         });
     });
 }
@@ -376,17 +311,17 @@ fn bench_complex_bit_operations(c: &mut Criterion) {
 
 // INDEX IN SUBGROUPS BENCHMARKS
 
-fn bench_create_index_in_subgroups(c: &mut Criterion) {
-    let mut group = c.benchmark_group("create_index_in_subgroups");
+fn bench_create_field_index_in_subgroups(c: &mut Criterion) {
+    let mut group = c.benchmark_group("create_field_index_in_subgroups");
     for size in [1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let products = create_products(size);
             let root = GroupData::new_root("Root".to_string(), products, "All");
-            root.group_by(|p| p.category.clone(), "Categories");
+            root.group_by(|p| p.category.clone(), "Categories").unwrap();
             
             b.iter(|| {
-                root.create_index_in_subgroups("price", |p: &Product| black_box((p.price * 100.0) as i64));
+                root.create_field_index_in_subgroups("price", |p: &Product| black_box((p.price * 100.0) as i64)).unwrap();
             });
         });
     }
@@ -394,22 +329,22 @@ fn bench_create_index_in_subgroups(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_create_index_recursive(c: &mut Criterion) {
+fn bench_create_field_index_recursive(c: &mut Criterion) {
     let products = create_products(10000);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.category.clone(), "Categories");
+    root.group_by(|p| p.category.clone(), "Categories").unwrap();
     for subgroup in root.get_all_subgroups() {
-        subgroup.group_by(|p| p.brand.clone(), "Brands");
+        subgroup.group_by(|p| p.brand.clone(), "Brands").unwrap();
     }
-    c.bench_function("create_index_recursive", |b| {
+    c.bench_function("create_field_index_recursive", |b| {
         b.iter(|| {
-            root.create_index_recursive("id", |p: &Product| black_box(p.id));
+            root.create_field_index_recursive("id", |p: &Product| black_box(p.id)).unwrap();
         });
     });
 }
 
-fn bench_group_by_with_indexes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("group_by_with_indexes");
+fn bench_group_by_with_field_indexes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_by_with_field_indexes");
     for size in [1000, 10000, 100000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -421,10 +356,11 @@ fn bench_group_by_with_indexes(c: &mut Criterion) {
                     |p| black_box(p.category.clone()),
                     "Categories",
                     |fd| {
-                        fd.create_index("id", |p: &Product| p.id)
-                            .create_index("price", |p: &Product| (p.price * 100.0) as i64);
+                        fd.create_field_index("id", |p: &Product| p.id).unwrap();
+                        fd.create_field_index("price", |p: &Product| (p.price * 100.0) as i64).unwrap();
+                        Ok(())
                     },
-                );
+                ).unwrap();
             });
         });
     }
@@ -438,7 +374,7 @@ fn bench_btree_subgroup_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("btree_subgroup_access");
     let products = create_products(10000);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.brand.clone(), "Brands");
+    root.group_by(|p| p.brand.clone(), "Brands").unwrap();
     group.bench_function("get_subgroup", |b| {
         b.iter(|| {
             black_box(root.get_subgroup(&"Apple".to_string()));
@@ -463,85 +399,25 @@ fn bench_btree_subgroup_access(c: &mut Criterion) {
 }
 
 
-// COMBINED OPERATIONS BENCHMARKS
+// CONCURRENT BENCHMARKS (Original)
 
-fn bench_hierarchical_filtering_with_indexes(c: &mut Criterion) {
-    let products = create_products(100000);
-    let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.create_index("category", |p: &Product| p.category.clone())
-        .create_index("price", |p: &Product| (p.price * 100.0) as i64)
-        .create_bit_index("is_available", |p: &Product| p.is_available)
-        .create_bit_index("in_stock", |p: &Product| p.stock > 10);
-    c.bench_function("hierarchical_filtering_with_indexes", |b| {
-        b.iter(|| {
-            // Level 1: Category filter
-            root.apply_index_filter("category", &black_box("Phones".to_string()));
-            // Level 2: Price range
-            root.apply_index_range("price", black_box(60000i64)..black_box(80000i64));
-            // Level 3: Bit operations
-            root.apply_bit_operation(&[
-                ("is_available", BitOp::And),
-                ("in_stock", BitOp::And),
-            ]);
-            let count = root.data.len();
-            // Reset
-            root.reset_filters();
-            black_box(count);
-        });
-    });
-}
-
-fn bench_complex_query_workflow(c: &mut Criterion) {
-    let products = create_products(100000);
-    c.bench_function("complex_query_workflow", |b| {
-        b.iter(|| {
-            // Create root with indexes
-            let root = GroupData::new_root_with_indexes(
-                "Store".to_string(),
-                products.clone(),
-                "All",
-                |fd| {
-                    fd.create_index("id", |p: &Product| p.id)
-                        .create_index("category", |p: &Product| p.category.clone())
-                        .create_index("price", |p: &Product| (p.price * 100.0) as i64)
-                        .create_bit_index("available", |p: &Product| p.is_available);
-                    fd
-                },
-            );
-            // Group by category with indexes
-            root.group_by_with_indexes(
-                |p| p.category.clone(),
-                "Categories",
-                |fd| {
-                    fd.create_index("price", |p: &Product| (p.price * 100.0) as i64);
-                },
-            );
-            // Query specific group
-            if let Some(phones) = root.get_subgroup(&"Phones".to_string()) {
-                let top_10 = phones.get_top_n_by_index::<i64>("price", 10);
-                black_box(top_10);
-            }
-            black_box(root);
-        });
-    });
-}
-
-
-// CONCURRENT BENCHMARKS (Original + with indexes)
 fn bench_parallel_filter(c: &mut Criterion) {
     let products = create_products(1000);
     let root = GroupData::new_root("Root".to_string(), products, "All");
-    root.group_by(|p| p.category.clone(), "Categories");
+    root.group_by(|p| p.category.clone(), "Categories").unwrap();
     let phones = root.get_subgroup(&"Phones".to_string()).unwrap();
     let laptops = root.get_subgroup(&"Laptops".to_string()).unwrap();
     let tablets = root.get_subgroup(&"Tablets".to_string()).unwrap();
     c.bench_function("parallel_filter", |b| {
         b.iter(|| {
+            phones.reset_filters();
+            laptops.reset_filters();
+            tablets.reset_filters();
             group_filter_parallel!(
                 phones => |p: &Product| black_box(p.price > 800.0),
                 laptops => |p: &Product| black_box(p.price > 1500.0),
                 tablets => |p: &Product| black_box(p.price > 600.0),
-            );
+            ).unwrap();
         });
     });
 }
@@ -559,7 +435,7 @@ fn bench_memory_allocation(c: &mut Criterion) {
             b.iter(|| {
                 let products = create_products(size);
                 let root = GroupData::new_root("Root".to_string(), products, "All");
-                root.group_by(|p| p.category.clone(), "Categories");
+                root.group_by(|p| p.category.clone(), "Categories").unwrap();
                 black_box(root);
             });
         });
@@ -567,8 +443,8 @@ fn bench_memory_allocation(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_memory_with_indexes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memory_with_indexes");
+fn bench_memory_with_field_indexes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memory_with_field_indexes");
     for size in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -579,14 +455,14 @@ fn bench_memory_with_indexes(c: &mut Criterion) {
                     products,
                     "All",
                     |fd| {
-                        fd.create_index("id", |p: &Product| p.id)
-                            .create_index("category", |p: &Product| p.category.clone())
-                            .create_index("price", |p: &Product| (p.price * 100.0) as i64)
-                            .create_bit_index("is_available", |p: &Product| p.is_available)
-                            .create_bit_index("in_stock", |p: &Product| p.stock > 10);
-                        fd
+                        fd.create_field_index("id", |p: &Product| p.id).unwrap();
+                        fd.create_field_index("category", |p: &Product| p.category.clone()).unwrap();
+                        fd.create_field_index("price", |p: &Product| (p.price * 100.0) as i64).unwrap();
+                        fd.create_field_index("is_available", |p: &Product| p.is_available).unwrap();
+                        fd.create_field_index("in_stock", |p: &Product| p.stock > 10).unwrap();
+                        Ok(fd)
                     },
-                );
+                ).unwrap();
                 black_box(root);
             });
         });
@@ -600,18 +476,18 @@ fn bench_deep_hierarchy(c: &mut Criterion) {
     c.bench_function("deep_hierarchy_creation", |b| {
         b.iter(|| {
             root.clear_subgroups();
-            root.group_by(|p| p.category.clone(), "Level1");
+            root.group_by(|p| p.category.clone(), "Level1").unwrap();
             
             for cat in ["Phones", "Laptops", "Tablets"].iter() {
                 if let Some(group) = root.get_subgroup(&cat.to_string()) {
-                    group.group_by(|p| p.brand.clone(), "Level2");
+                    group.group_by(|p| p.brand.clone(), "Level2").unwrap();
                     
                     for brand in ["Apple", "Samsung"].iter() {
                         if let Some(brand_group) = group.get_subgroup(&brand.to_string()) {
                             brand_group.group_by(|p| {
                                 if p.price > 800.0 { "Premium".to_string() }
                                 else { "Budget".to_string() }
-                            }, "Level3");
+                            }, "Level3").unwrap();
                         }
                     }
                 }
@@ -631,33 +507,25 @@ criterion_group!(
     bench_clear_subgroups,
     bench_collect_all_groups,
     // Index creation
-    bench_create_single_index,
-    bench_create_multiple_indexes,
-    bench_create_bit_index,
-    bench_group_creation_with_indexes,
-    // Index search
-    bench_filter_by_index_vs_normal,
-    bench_filter_by_index_range,
-    bench_get_sorted_by_index,
-    bench_get_top_n_by_index,
-    // Bit operations
-    bench_bit_operation_and,
-    bench_bit_operation_vs_normal_filter,
-    bench_complex_bit_operations,
+    bench_create_single_field_index,
+    bench_create_multiple_field_indexes,
+    bench_create_field_index,
+    bench_group_creation_with_field_indexes,
+    // Index operations
+    bench_field_index_operation_and,
+    bench_field_index_operation_vs_normal_filter,
+    bench_complex_field_index_operations,
     // Indexes in subgroups
-    bench_create_index_in_subgroups,
-    bench_create_index_recursive,
-    bench_group_by_with_indexes,
+    bench_create_field_index_in_subgroups,
+    bench_create_field_index_recursive,
+    bench_group_by_with_field_indexes,
     // BTree operations
     bench_btree_subgroup_access,
-    // Combined operations
-    bench_hierarchical_filtering_with_indexes,
-    bench_complex_query_workflow,
     // Concurrent
     bench_parallel_filter,
     // Memory
     bench_memory_allocation,
-    bench_memory_with_indexes,
+    bench_memory_with_field_indexes,
     bench_deep_hierarchy,
 );
 

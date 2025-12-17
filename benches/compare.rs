@@ -1,24 +1,28 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, BatchSize,Throughput};
-use tree_man::group::GroupData;
-use std::hint::black_box;
-use std::sync::Arc;
-use std::time::Duration;
-
-use im::{Vector as ImVector, HashMap as ImHashMap, OrdMap as ImOrdMap};
-use rpds::Vector as RpdsVector;
+use criterion::{criterion_group, criterion_main, Criterion,Throughput};
+use tree_man::{
+    FilterData,
+    FieldOperation,
+    Op,
+};
 use rayon::prelude::*;
+use std::{
+    hint::black_box,
+    sync::Arc,
+    time::Duration,
+};
+
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Product {
     id: u64,
     category: String,
     brand: String,
-    price: u64,  // Changed to u64 for Eq/Hash
-    rating: u64, // Changed to u64 (rating * 100)
+    price: u64,
+    rating: u64,
     in_stock: bool,
 }
 
-fn create_products(count: usize) -> Vec<Product> {
+fn create_products_low_cardinality(count: usize) -> Vec<Product> {
     (0..count).map(|i| Product {
         id: i as u64,
         category: ["Phones", "Laptops", "Tablets", "Accessories"][i % 4].to_string(),
@@ -29,495 +33,458 @@ fn create_products(count: usize) -> Vec<Product> {
     }).collect()
 }
 
+fn create_products_high_cardinality(size: usize) -> Vec<Arc<Product>> {
+    (0..size)
+        .map(|i| {
+            Arc::new(Product {
+                id: i as u64,
+                category: format!("Category_{}", i % 100),
+                brand: format!("Brand_{}", i % 50),
+                price: i as u64, // уникальные цены
+                rating: ((i % 5) + 1) as u64 ,
+                in_stock: i % 2 == 0,
+            })
+        })
+        .collect()
+}
 
-//  MULTI-THREADED (все используют Rayon)
-
-fn bench_multi_threaded_creation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("02_multi_threaded/creation");
+fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
     group.measurement_time(Duration::from_secs(10));
-    for size in [1_000, 10_000, 100_000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        // TreeMan С Rayon
-        group.bench_with_input(
-            BenchmarkId::new("TreeMan_parallel", size),
-            size,
-            |b, &size| {
-                b.iter_batched(
-                    || create_products(size),
-                    |products| {
-                        let root = GroupData::new_root(
-                            "Root".to_string(),
-                            products,
-                            "All Products"
-                        );
-                        black_box(root)
-                    },
-                    BatchSize::LargeInput
-                );
-            }
-        );
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
 
-        // im::Vector С Rayon (через Vec)
-        group.bench_with_input(
-            BenchmarkId::new("im::Vector_parallel", size),
-            size,
-            |b, &size| {
-                b.iter_batched(
-                    || create_products(size),
-                    |products| {
-                        let vec_data: Vec<Product> = products
-                            .into_par_iter()
-                            .collect();
-                        let data: ImVector<Product> = vec_data
-                            .into_iter()
-                            .collect();
-                        black_box(data)
-                    },
-                    BatchSize::LargeInput
-                );
-            }
-        );
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
         
-        // rpds::Vector С Rayon
-        group.bench_with_input(
-            BenchmarkId::new("rpds::Vector_parallel", size),
-            size,
-            |b, &size| {
-                b.iter_batched(
-                    || create_products(size),
-                    |products| {
-                        let vec_data: Vec<Product> = products
-                            .into_par_iter()
-                            .collect();
-                        
-                        let mut data = RpdsVector::new();
-                        for p in vec_data {
-                            data.push_back_mut(p);
-                        }
-                        black_box(data)
-                    },
-                    BatchSize::LargeInput
-                );
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::eq(price),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
             }
-        );
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
         
-        // im::HashMap С Rayon (через промежуточный Vec)
-        group.bench_with_input(
-            BenchmarkId::new("im::HashMap_parallel", size),
-            size,
-            |b, &size| {
-                b.iter_batched(
-                    || create_products(size),
-                    |products| {
-                        // Параллельная группировка через Vec<(K, V)>
-                        use std::collections::HashMap as StdHashMap;
-                        
-                        let groups: Vec<(String, Vec<Product>)> = products
-                            .into_par_iter()
-                            .fold(
-                                || StdHashMap::new(),
-                                |mut acc, p| {
-                                    acc.entry(p.category.clone())
-                                        .or_insert_with(Vec::new)
-                                        .push(p);
-                                    acc
-                                }
-                            )
-                            .reduce(
-                                || StdHashMap::new(),
-                                |mut a, b| {
-                                    for (k, mut v) in b {
-                                        a.entry(k).or_insert_with(Vec::new).append(&mut v);
-                                    }
-                                    a
-                                }
-                            )
-                            .into_iter()
-                            .collect();
-                        
-                        let map: ImHashMap<String, Vec<Product>> = groups.into_iter().collect();
-                        black_box(map)
-                    },
-                    BatchSize::LargeInput
-                );
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price == price as u64).unwrap();
+                black_box(data.len());
             }
-        );
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
         
-        // im::OrdMap С Rayon
-        group.bench_with_input(
-            BenchmarkId::new("im::OrdMap_parallel", size),
-            size,
-            |b, &size| {
-                b.iter_batched(
-                    || create_products(size),
-                    |products| {
-                        use std::collections::HashMap as StdHashMap;
-                        
-                        let groups: Vec<(String, Vec<Product>)> = products
-                            .into_par_iter()
-                            .fold(
-                                || StdHashMap::new(),
-                                |mut acc, p| {
-                                    acc.entry(p.category.clone())
-                                        .or_insert_with(Vec::new)
-                                        .push(p);
-                                    acc
-                                }
-                            )
-                            .reduce(
-                                || StdHashMap::new(),
-                                |mut a, b| {
-                                    for (k, mut v) in b {
-                                        a.entry(k).or_insert_with(Vec::new).append(&mut v);
-                                    }
-                                    a
-                                }
-                            )
-                            .into_iter()
-                            .collect();
-                        
-                        let map: ImOrdMap<String, Vec<Product>> = groups.into_iter().collect();
-                        black_box(map)
-                    },
-                    BatchSize::LargeInput
-                );
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
             }
-        );
-    }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
     
     group.finish();
 }
 
-fn bench_multi_threaded_filtering(c: &mut Criterion) {
-    let mut group = c.benchmark_group("02_multi_threaded/filtering");
+
+fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
     group.measurement_time(Duration::from_secs(10));
-    for size in [50,500,5000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        // TreeMan С Rayon
-        group.bench_with_input(
-            BenchmarkId::new("TreeMan_parallel", size),
-            size,
-            |b, &size| {
-                let products = create_products(size);
-                let root = GroupData::new_root(
-                    "Root".to_string(),
-                    products,
-                    "All Products"
-                );
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::eq(price),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price == price as u64).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_multiple_queries_in_values_with_indexes_high_cadinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_in_value_index_100q_high_cadinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::in_values(prices),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_in_value_no_index_100q_high_cadinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                data.reset_to_source();
+                data.filter(|p| prices.contains(&p.price)).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_in_value_baseline_100q_high_cadinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| prices.contains(&p.price))
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_in_value_parallel_100q_high_cadinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| prices.contains(&p.price))
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_multiple_queries_in_values_with_indexes_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_in_value_index_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::in_values(prices),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_in_value_no_index_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                data.reset_to_source();
+                data.filter(|p| prices.contains(&p.price)).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_in_value_baseline_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| prices.contains(&p.price))
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_in_value_parallel_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let prices = vec![price,price+100,price+200];
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| prices.contains(&p.price))
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_multiple_queries_in_range_with_indexes_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_in_range_index_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::range(price, price * 15),Op::And)]).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+
+        // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_in_range_no_index_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price >= price && p.price <= price * 15).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_in_range_baseline_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price >= price && p.price <= price * 15)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_in_range_parallel_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price >= price && p.price <= price * 15)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+
+fn bench_multiple_queries_in_range_with_indexes_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(100)); // 100 queries
+    let init_products = create_products_low_cardinality(size);
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_in_range_index_100q_low_cardinality", |b| {
+        let data = FilterData::from_vec(init_products.clone());
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::range(price, price * 15),Op::And)]).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+
+        // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_in_range_no_index_100q_low_cardinality", |b| {
+        let data = FilterData::from_vec(init_products.clone());
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price >= price && p.price <= price * 15).unwrap();
                 
-                b.iter(|| {
-                    root.reset_filters();
-                    root.filter(|p| p.price > 700);
-                    root.filter(|p| p.rating > 300);
-                    root.filter(|p| p.in_stock);
-                    black_box(root.data.len())
-                });
+                black_box(data.len());
             }
-        );
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_in_range_baseline_100q_low_cardinality", |b| {
+        let products = init_products.clone();
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price >= price && p.price <= price * 15)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_in_range_parallel_100q_low_cardinality", |b| {
+        let products = init_products.clone();
         
-        // im::Vector С Rayon (через Vec)
-        group.bench_with_input(
-            BenchmarkId::new("im::Vector_parallel", size),
-            size,
-            |b, &size| {
-                let products = create_products(size);
-                let data: ImVector<Product> = products.into_iter().collect();
-                b.iter(|| {
-                    let vec: Vec<Product> = data.iter().cloned().collect();
-                    let filtered1: Vec<Product> = vec
-                        .par_iter()
-                        .filter(|p| p.price > 700)
-                        .cloned()
-                        .collect();
-                    let filtered2: Vec<Product> = filtered1
-                        .par_iter()
-                        .filter(|p| p.rating > 300)
-                        .cloned()
-                        .collect();
-                    let filtered3: Vec<Product> = filtered2
-                        .par_iter()
-                        .filter(|p| p.in_stock)
-                        .cloned()
-                        .collect();
-                    let result: ImVector<Product> = filtered3.into_iter().collect();
-                    black_box(result.len())
-                });
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price >= price && p.price <= price * 15)
+                    .collect();
+                black_box(filtered.len());
             }
-        );
-    }
+        });
+    });
     
     group.finish();
 }
-
-
-// PARALLELISM IMPACT
-
-fn bench_parallelism_impact(c: &mut Criterion) {
-    let mut group = c.benchmark_group("03_parallelism_impact");
-    group.measurement_time(Duration::from_secs(10));
-    let size = 100_000;
-    group.throughput(Throughput::Elements(size as u64));
-    // TreeMan: Sequential vs Parallel
-    group.bench_function("TreeMan_sequential", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                let arc_items: Vec<Arc<Product>> = products
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect();
-                black_box(arc_items)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    
-    group.bench_function("TreeMan_parallel", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                let root = GroupData::new_root(
-                    "Root".to_string(),
-                    products,
-                    "All Products"
-                );
-                black_box(root)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    
-    // im::Vector: Sequential vs Parallel
-    group.bench_function("im::Vector_sequential", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                let data: ImVector<Product> = products
-                    .into_iter()
-                    .collect();
-                black_box(data)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    
-    group.bench_function("im::Vector_parallel", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                let vec_data: Vec<Product> = products
-                    .into_par_iter()
-                    .collect();
-                let data: ImVector<Product> = vec_data
-                    .into_iter()
-                    .collect();
-                black_box(data)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    
-    // im::HashMap: Sequential vs Parallel
-    group.bench_function("im::HashMap_sequential", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                let mut map = ImHashMap::new();
-                for p in products {
-                    map.entry(p.category.clone())
-                        .or_insert_with(Vec::new)
-                        .push(p);
-                }
-                black_box(map)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    
-    group.bench_function("im::HashMap_parallel", |b| {
-        b.iter_batched(
-            || create_products(size),
-            |products| {
-                use std::collections::HashMap as StdHashMap;
-                let groups: Vec<(String, Vec<Product>)> = products
-                    .into_par_iter()
-                    .fold(
-                        || StdHashMap::new(),
-                        |mut acc, p| {
-                            acc.entry(p.category.clone())
-                                .or_insert_with(Vec::new)
-                                .push(p);
-                            acc
-                        }
-                    )
-                    .reduce(
-                        || StdHashMap::new(),
-                        |mut a, b| {
-                            for (k, mut v) in b {
-                                a.entry(k).or_insert_with(Vec::new).append(&mut v);
-                            }
-                            a
-                        }
-                    )
-                    .into_iter()
-                    .collect();
-                
-                let map: ImHashMap<String, Vec<Product>> = groups.into_iter().collect();
-                black_box(map)
-            },
-            BatchSize::LargeInput
-        );
-    });
-    group.finish();
-}
-
-
-// UNIQUE FEATURES
-
-fn bench_unique_hierarchical_grouping(c: &mut Criterion) {
-    let mut group = c.benchmark_group("04_unique_features/hierarchical");
-    group.measurement_time(Duration::from_secs(10));
-    for size in [100_000, 1_000_000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("TreeMan", size),
-            size,
-            |b, &size| {
-                let products = create_products(size);
-                let root = GroupData::new_root(
-                    "Root".to_string(),
-                    products,
-                    "All Products"
-                );
-                b.iter(|| {
-                    root.clear_subgroups();
-                    // Level 1: By category
-                    root.group_by(|p| p.category.clone(), "By Category");
-                    // Level 2: By brand (nested!)
-                    let categories = root.subgroups_keys();
-                    for cat_key in categories {
-                        if let Some(cat_group) = root.get_subgroup(&cat_key) {
-                            cat_group.group_by(|p| p.brand.clone(), "By Brand");
-                        }
-                    }
-                    black_box(root.collect_all_groups().len())
-                });
-            }
-        );
-        
-        // im::HashMap: эмуляция иерархии (вложенные Maps)
-        group.bench_with_input(
-            BenchmarkId::new("im::HashMap_nested", size),
-            size,
-            |b, &size| {
-                let products = create_products(size);
-                b.iter(|| {
-                    // Level 1: By category
-                    let mut cat_map: ImHashMap<String, Vec<Product>> = ImHashMap::new();
-                    for p in products.clone() {
-                        cat_map.entry(p.category.clone())
-                            .or_insert_with(Vec::new)
-                            .push(p);
-                    }
-                    // Level 2: By brand (nested)
-                    let mut nested: ImHashMap<String, ImHashMap<String, Vec<Product>>> = ImHashMap::new();
-                    for (category, prods) in cat_map {
-                        let mut brand_map: ImHashMap<String, Vec<Product>> = ImHashMap::new();
-                        for p in prods {
-                            brand_map.entry(p.brand.clone())
-                                .or_insert_with(Vec::new)
-                                .push(p);
-                        }
-                        nested.insert(category, brand_map);
-                    }
-                    black_box(nested.len())
-                });
-            }
-        );
-    }
-    
-    group.finish();
-}
-
-fn bench_unique_parallel_group_filtering(c: &mut Criterion) {
-    let mut group = c.benchmark_group("04_unique_features/parallel_groups");
-    group.measurement_time(Duration::from_secs(10));
-    for size in [10_000, 100_000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        let products = create_products(*size);
-        let root = GroupData::new_root(
-            "Root".to_string(),
-            products,
-            "All Products"
-        );
-        root.group_by(|p| p.category.clone(), "By Category");
-        let phones = root.get_subgroup(&"Phones".to_string()).unwrap();
-        let laptops = root.get_subgroup(&"Laptops".to_string()).unwrap();
-        let tablets = root.get_subgroup(&"Tablets".to_string()).unwrap();
-        let accessories = root.get_subgroup(&"Accessories".to_string()).unwrap();
-        // TreeMan: built-in parallel group filtering (УНИКАЛЬНО!)
-        group.bench_with_input(
-            BenchmarkId::new("TreeMan_builtin", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    phones.reset_filters();
-                    laptops.reset_filters();
-                    tablets.reset_filters();
-                    accessories.reset_filters();
-                    tree_man::group_filter_parallel!(
-                        phones => |p: &Product| p.price > 800,
-                        laptops => |p: &Product| p.price > 1500,
-                        tablets => |p: &Product| p.price > 600,
-                        accessories => |p: &Product| p.price > 50,
-                    );
-                    black_box((
-                        phones.data.len(),
-                        laptops.data.len()
-                    ))
-                });
-            }
-        );
-        
-        // Sequential для сравнения
-        group.bench_with_input(
-            BenchmarkId::new("TreeMan_sequential", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    phones.reset_filters();
-                    laptops.reset_filters();
-                    tablets.reset_filters();
-                    accessories.reset_filters();
-                    
-                    phones.filter(|p| p.price > 800);
-                    laptops.filter(|p| p.price > 1500);
-                    tablets.filter(|p| p.price > 600);
-                    accessories.filter(|p| p.price > 50);
-                    black_box((
-                        phones.data.len(),
-                        laptops.data.len()
-                    ))
-                });
-            }
-        );
-    }
-    
-    group.finish();
-}
-
-// CRITERION GROUPS
 
 criterion_group!(
     benches,
-    // сравнение: multi-threaded
-    bench_multi_threaded_creation,
-    bench_multi_threaded_filtering,
-    // parallelism
-    bench_parallelism_impact,
-    // Уникальные фичи
-    bench_unique_hierarchical_grouping,
-    bench_unique_parallel_group_filtering,
+    bench_multiple_queries_with_indexes_high_cardinality,
+    bench_multiple_queries_with_indexes_low_cardinality,
+    bench_multiple_queries_in_values_with_indexes_high_cadinality,
+    bench_multiple_queries_in_values_with_indexes_low_cardinality,
+    bench_multiple_queries_in_range_with_indexes_high_cardinality,
+    bench_multiple_queries_in_range_with_indexes_low_cardinality,
 );
 
 criterion_main!(benches);
