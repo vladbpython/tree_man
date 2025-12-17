@@ -48,15 +48,15 @@ fn create_products_high_cardinality(size: usize) -> Vec<Arc<Product>> {
         .collect()
 }
 
-fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_with_indexes_eq_price_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
     group.throughput(Throughput::Elements(100)); // 100 queries
 
     // FilterData WITH field index - мгновенные lookup'ы!
-    group.bench_function("FilterData_with_field_index_100q_high_cardinality", |b| {
+    group.bench_function("FilterData_with_field_index_eq_price_100q_high_cardinality", |b| {
         let products = create_products_high_cardinality(size);
         let data = FilterData::from_vec(products);
         data.create_field_index("price", |p| p.price).unwrap();
@@ -72,7 +72,7 @@ fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
     });
     
     // FilterData WITHOUT index - full scan каждый раз
-    group.bench_function("FilterData_no_index_100q_high_cardinality", |b| {
+    group.bench_function("FilterData_no_index_eq_price_100q_high_cardinality", |b| {
         let products = create_products_high_cardinality(size);
         let data = FilterData::from_vec(products);
         
@@ -86,7 +86,7 @@ fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
     });
     
     // Vec baseline - full scan каждый раз
-    group.bench_function("Vec_baseline_100q_high_cardinality", |b| {
+    group.bench_function("Vec_baseline_100q_eq_price_high_cardinality", |b| {
         let products = create_products_high_cardinality(size);
         
         b.iter(|| {
@@ -101,7 +101,7 @@ fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
     });
     
     // Vec parallel - full scan каждый раз
-    group.bench_function("Vec_parallel_100q_high_cardinality", |b| {
+    group.bench_function("Vec_parallel_100q_eq_price_high_cardinality", |b| {
         let products = create_products_high_cardinality(size);
         
         b.iter(|| {
@@ -118,16 +118,15 @@ fn bench_multiple_queries_with_indexes_high_cardinality(c: &mut Criterion) {
     group.finish();
 }
 
-
-fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_with_indexes_eq_price_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
     group.throughput(Throughput::Elements(100)); // 100 queries
 
     // FilterData WITH field index - мгновенные lookup'ы!
-    group.bench_function("FilterData_with_field_index_100q_low_cardinality", |b| {
+    group.bench_function("FilterData_with_field_index_eq_price_100q_low_cardinality", |b| {
         let products = create_products_low_cardinality(size);
         let data = FilterData::from_vec(products);
         data.create_field_index("price", |p| p.price).unwrap();
@@ -143,7 +142,7 @@ fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
     });
     
     // FilterData WITHOUT index - full scan каждый раз
-    group.bench_function("FilterData_no_index_100q_low_cardinality", |b| {
+    group.bench_function("FilterData_no_index_eq_price_100q_low_cardinality", |b| {
         let products = create_products_low_cardinality(size);
         let data = FilterData::from_vec(products);
         
@@ -157,7 +156,7 @@ fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
     });
     
     // Vec baseline - full scan каждый раз
-    group.bench_function("Vec_baseline_100q_low_cardinality", |b| {
+    group.bench_function("Vec_baseline_100q_eq_price_low_cardinality", |b| {
         let products = create_products_low_cardinality(size);
         
         b.iter(|| {
@@ -172,7 +171,7 @@ fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
     });
     
     // Vec parallel - full scan каждый раз
-    group.bench_function("Vec_parallel_100q_low_cardinality", |b| {
+    group.bench_function("Vec_parallel_100q_eq_price_low_cardinality", |b| {
         let products = create_products_low_cardinality(size);
         
         b.iter(|| {
@@ -189,8 +188,289 @@ fn bench_multiple_queries_with_indexes_low_cardinality(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_multiple_queries_in_values_with_indexes_high_cadinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_with_indexes_eq_bool_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_eq_bool_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("in_stock", |p| p.in_stock).unwrap();
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("in_stock", &[(FieldOperation::eq(true),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_eq_bool_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.in_stock == true).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_eq_bool_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.in_stock == true)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_eq_bool_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.in_stock == true)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_query_with_indexes_eq_bool_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_eq_bool_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("in_stock", |p| p.in_stock).unwrap();
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("in_stock", &[(FieldOperation::eq(true),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_eq_bool_100q_low_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.in_stock == true).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_eq_bool_low_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.in_stock == true)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_eq_bool_low_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for _ in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.in_stock == true)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_query_with_indexes_not_eq_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_not_eq_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::not_eq(price),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_not_eq_100q_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price != price as u64).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_not_eq_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price != price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_not_eq_high_cardinality", |b| {
+        let products = create_products_high_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price != price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+
+fn bench_query_with_indexes_not_eq_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
+    group.measurement_time(Duration::from_secs(10));
+    
+    let size = 2_000_000;
+    group.throughput(Throughput::Elements(100)); // 100 queries
+
+    // FilterData WITH field index - мгновенные lookup'ы!
+    group.bench_function("FilterData_with_field_index_not_eq_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        data.create_field_index("price", |p| p.price).unwrap();
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter_by_field_ops("price", &[(FieldOperation::eq(price),Op::And)]).unwrap();
+                assert!(data.len() > 0);
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // FilterData WITHOUT index - full scan каждый раз
+    group.bench_function("FilterData_no_index_not_eq_100q_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        let data = FilterData::from_vec(products);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                data.reset_to_source();
+                data.filter(|p| p.price == price as u64).unwrap();
+                black_box(data.len());
+            }
+        });
+    });
+    
+    // Vec baseline - full scan каждый раз
+    group.bench_function("Vec_baseline_100q_not_eq_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    // Vec parallel - full scan каждый раз
+    group.bench_function("Vec_parallel_100q_not_eq_low_cardinality", |b| {
+        let products = create_products_low_cardinality(size);
+        
+        b.iter(|| {
+            for price in 100..200 {
+                let filtered: Vec<_> = products
+                    .par_iter()
+                    .filter(|p| p.price == price as u64)
+                    .collect();
+                black_box(filtered.len());
+            }
+        });
+    });
+    
+    group.finish();
+}
+
+fn bench_query_in_values_with_indexes_high_cadinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
@@ -263,8 +543,8 @@ fn bench_multiple_queries_in_values_with_indexes_high_cadinality(c: &mut Criteri
     group.finish();
 }
 
-fn bench_multiple_queries_in_values_with_indexes_low_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_in_values_with_indexes_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
@@ -337,8 +617,8 @@ fn bench_multiple_queries_in_values_with_indexes_low_cardinality(c: &mut Criteri
     group.finish();
 }
 
-fn bench_multiple_queries_in_range_with_indexes_high_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_in_range_with_indexes_high_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
@@ -408,8 +688,8 @@ fn bench_multiple_queries_in_range_with_indexes_high_cardinality(c: &mut Criteri
 }
 
 
-fn bench_multiple_queries_in_range_with_indexes_low_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("01_multi_threaded/multiple_queries");
+fn bench_query_in_range_with_indexes_low_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_query");
     group.measurement_time(Duration::from_secs(10));
     
     let size = 2_000_000;
@@ -479,12 +759,16 @@ fn bench_multiple_queries_in_range_with_indexes_low_cardinality(c: &mut Criterio
 
 criterion_group!(
     benches,
-    bench_multiple_queries_with_indexes_high_cardinality,
-    bench_multiple_queries_with_indexes_low_cardinality,
-    bench_multiple_queries_in_values_with_indexes_high_cadinality,
-    bench_multiple_queries_in_values_with_indexes_low_cardinality,
-    bench_multiple_queries_in_range_with_indexes_high_cardinality,
-    bench_multiple_queries_in_range_with_indexes_low_cardinality,
+    bench_query_with_indexes_eq_price_high_cardinality,
+    bench_query_with_indexes_eq_price_low_cardinality,
+    bench_query_with_indexes_eq_bool_high_cardinality,
+    bench_query_with_indexes_eq_bool_low_cardinality,
+    bench_query_with_indexes_not_eq_high_cardinality,
+    bench_query_with_indexes_not_eq_low_cardinality,
+    bench_query_in_values_with_indexes_high_cadinality,
+    bench_query_in_values_with_indexes_low_cardinality,
+    bench_query_in_range_with_indexes_high_cardinality,
+    bench_query_in_range_with_indexes_low_cardinality,
 );
 
 criterion_main!(benches);
